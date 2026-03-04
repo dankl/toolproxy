@@ -4,7 +4,7 @@ Generischer Tool-Call-Proxy für das OCI-Modell (`gpt-oss-120b`). Übersetzt Ope
 
 ## Warum?
 
-Das OCI-Modell unterstützt native OpenAI tool_calls nicht zuverlässig. Es produziert XML-Tool-Calls stabil, wenn die Conversation-History XML enthält. Dieser Proxy erledigt die Übersetzung transparent.
+Das OCI-Modell (`gpt-oss-120b`) unterstützt native OpenAI `tool_calls` nicht zuverlässig. Es produziert XML-Tool-Calls jedoch stabil, wenn die Conversation-History XML enthält. Dieser Proxy erledigt die Übersetzung transparent — der Client sieht immer Standard-OpenAI-Format, das Modell immer XML.
 
 ## Flow
 
@@ -20,6 +20,7 @@ oci-proxy :8005 → Oracle OCI GenAI
   ↓  XML tool call in response
 toolproxy
   ├─ XML parsen → OpenAI tool_calls (primär)
+  ├─ Partial XML rescue (abgeschnittene Responses)
   └─ JSON-Fallback-Kaskade (wenn kein XML gefunden)
   ↑  Standard OpenAI response mit tool_calls[]
 Client
@@ -63,8 +64,10 @@ Damit das Modell in jedem Turn konsistentes XML sieht, werden eingehende Nachric
 ### 4. XML-Parsing + Fallbacks
 Reihenfolge beim Parsen der Modell-Antwort:
 1. **XML** (primär) — regulärer Ausdruck über bekannte Tool-Namen
-2. **Tool-Name-Aliasing** — halluzinierte Namen korrigieren (`write_file` → `write_to_file`)
-3. **JSON-Kaskade** (Fallback) — `[Tool Call:]`, `### TOOL_CALL`, bare JSON, Code-Blöcke
+2. **Partial XML rescue** — `<path>`/`<content>` extrahieren auch ohne schließenden Tag
+3. **Tool-Name-Aliasing** — halluzinierte Namen korrigieren (`write_file` → `write_to_file`)
+4. **JSON-Kaskade** (Fallback) — `[Tool Call:]`, `### TOOL_CALL`, bare JSON, Code-Blöcke
+5. **Text-Synthesis** — Prosa-Antwort → `write_to_file` oder `attempt_completion`
 
 ## Konfiguration
 
@@ -152,6 +155,23 @@ curl -X POST http://localhost:8007/v1/chat/completions \
   }'
 ```
 
+## Tests
+
+Unit- und Integrationstests liegen in `tests/`. Sie mocken den Upstream komplett — kein laufender Container nötig.
+
+```bash
+# Abhängigkeiten installieren (einmalig)
+pip install -r requirements-test.txt
+
+# Alle Tests ausführen
+python3 -m pytest -v
+
+# Nur eine Test-Klasse
+python3 -m pytest -v tests/test_roundtrip.py::TestXmlToolCalls
+```
+
+Aktuelle Test-Coverage: ~52 Tests in `test_roundtrip.py` und `test_xml_parser.py`.
+
 ## Bekannte Modell-Eigenheiten & Proxy-Fixes
 
 ### apply_diff für neue Dateien → write_to_file (implementiert)
@@ -180,6 +200,39 @@ Unterdrückt durch: XML-Instruktion VOR dem System-Prompt + 3 Priming-Turns + ex
 ### Modell plant nicht mehrstufig
 Das Modell neigt dazu, nach 1–2 Datei-Writes sofort `attempt_completion` aufzurufen statt alle Dateien zu schreiben. Adressiert durch Prompt-Regel:
 > *"A task is ONLY complete when ALL required files exist on disk. Write every file with write_to_file first, THEN call attempt_completion."*
+
+### Sonderzeichen in Datei-Inhalten (implementiert)
+Wenn das Modell Dateien mit Code-Inhalten schreibt, enthält `<content>` oft XML-ungültige Zeichen:
+
+| Zeichen | Kontext | Beispiel |
+|---|---|---|
+| `&&` | Shell-Befehle | `npm install && pip install` |
+| `&` | Standalone-Operator | `Linter & Formatter` |
+| `=>` | JavaScript Arrow Functions | `(req, res) => { ... }` |
+
+Der XML-Parser schlägt fehl, wenn solche Zeichen unescaped im `<content>`-Tag auftreten. `fix_xml_string` (in `services/xml_parser.py`) pre-escaped diese Zeichen automatisch vor dem Parsen. Betrifft die Tags `content`, `diff`, `result` und `output`.
+
+### Abgeschnittene XML-Responses — Partial XML rescue (implementiert)
+Das Modell gibt gelegentlich `<write_to_file>`-Responses zurück, die keinen schließenden `</write_to_file>`-Tag haben (Response wird vom Upstream abgeschnitten). Der reguläre Ausdruck findet dann keine Übereinstimmung, und es gibt keine `WARNING`-Logzeile — der Response landet ohne Fix in `attempt_completion`.
+
+Der Partial XML rescue extrahiert `<path>` und `<content>` unabhängig vom schließenden Tag:
+
+```python
+re.search(
+    r"<write(?:_to)?_file\b[^>]*>\s*<path>(.*?)</path>\s*<content>([\s\S]+?)(?:</content>|$)",
+    stripped,
+    re.IGNORECASE,
+)
+```
+
+Greift auch wenn der Tag als `<write_file>` (Alias) beginnt.
+
+Im Log sichtbar als:
+```
+INFO  [abc12345] Partial XML rescue → write_to_file('Plan.md')
+```
+
+**Diagnose-Tipp**: Wenn das Modell eine Datei nicht erstellt und im Log kein `WARNING` vor der `Text response → synthesizing`-Zeile steht, war der Response wahrscheinlich abgeschnitten.
 
 ## Bekannte Einschränkungen & Potenzielle Verbesserungen
 
@@ -216,13 +269,14 @@ WARNING [abc12345] SUCCESS LOOP: 2 consecutive successful write operations — i
 
 ```
 INFO  [abc12345] model=gpt-oss-120b messages=3 tools=12
-INFO  [abc12345] XML parsed 1 tool call(s)                          ← Normalfall
-INFO  [abc12345] XML alias: 'write_file' → 'write_to_file'          ← Tool-Name-Aliasing
-INFO  [abc12345] JSON fallback: [Tool Call:] → read_file            ← JSON-Fallback
-INFO  [abc12345] apply_diff all-additions on 'Main.java' → write_to_file  ← Diff-Konvertierung
-INFO  [abc12345] 3 tool calls → keeping only first ('write_to_file')  ← Multi-Call Limit
+INFO  [abc12345] XML parsed 1 tool call(s)                               ← Normalfall
+INFO  [abc12345] XML alias: 'write_file' → 'write_to_file'               ← Tool-Name-Aliasing
+INFO  [abc12345] Partial XML rescue → write_to_file('Plan.md')           ← Abgeschnittener Response
+INFO  [abc12345] JSON fallback: [Tool Call:] → read_file                 ← JSON-Fallback
+INFO  [abc12345] apply_diff all-additions on 'Main.java' → write_to_file ← Diff-Konvertierung
+INFO  [abc12345] 3 tool calls → keeping only first ('write_to_file')     ← Multi-Call Limit
 INFO  [abc12345] Text response looks like file content → synthesizing write_to_file(...)  ← Text-Synthesis
-INFO  [abc12345] Text response → synthesizing attempt_completion fallback  ← Synthesis-Fallback
-INFO  [abc12345] No tool calls found — returning text response      ← Reine Textantwort
+INFO  [abc12345] Text response → synthesizing attempt_completion fallback ← Synthesis-Fallback
+INFO  [abc12345] No tool calls found — returning text response           ← Reine Textantwort
 WARNING [abc12345] SUCCESS LOOP: 2 consecutive successful write operations — injecting stop hint
 ```
