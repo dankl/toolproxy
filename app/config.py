@@ -12,13 +12,13 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
-    # Upstream LLM (oci-proxy or LiteLLM)
+    # Upstream LLM (any OpenAI-compatible endpoint)
     upstream_url: str = Field(
-        default="http://oci-proxy:8005/v1",
+        default="http://localhost:8000/v1",
         description="Base URL of the upstream OpenAI-compatible API",
     )
     upstream_model: str = Field(
-        default="openai/gpt-oss-120b",
+        default="your-model-name",
         description="Model name to forward to upstream",
     )
     upstream_api_key: str = Field(

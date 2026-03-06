@@ -2,7 +2,7 @@
 XML system prompt builder for toolproxy.
 
 Converts OpenAI tool definitions → XML examples for the system prompt,
-enabling the OCI model (gpt-oss-120b) to output XML tool calls reliably.
+enabling models without native function-call support to output XML tool calls reliably.
 """
 from enum import Enum
 from typing import Dict, List, Optional

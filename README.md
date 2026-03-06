@@ -1,10 +1,19 @@
 # toolproxy
 
-Generischer Tool-Call-Proxy für das OCI-Modell (`gpt-oss-120b`). Übersetzt OpenAI-native `tool_calls` in XML-Format und zurück — für jeden OpenAI-kompatiblen Client (Roo Code, opencode, etc.).
+Tool-Call-Proxy für OpenAI-kompatible Sprachmodelle ohne nativen Function-Call-Support. Übersetzt OpenAI-native `tool_calls` in XML-Format und zurück — für jeden OpenAI-kompatiblen Client (Roo Code, opencode, etc.).
+
+## Getestet mit
+
+| Modell | Anmerkung |
+|---|---|
+| `gpt-oss-120b` | Primäres Entwicklungsmodell; Chat-Template-Leak-Verhalten bekannt und abgefangen |
+| `gpt-oss-20b` | Frühere Version; Grundlage für initiales XML-Priming-Konzept |
+
+Das XML-Format und alle Fallbacks wurden auf Basis dieser Modelle entwickelt. Andere Modelle ohne native Function-Call-Unterstützung sollten funktionieren, können aber andere Eigenheiten zeigen.
 
 ## Warum?
 
-Das OCI-Modell (`gpt-oss-120b`) unterstützt native OpenAI `tool_calls` nicht zuverlässig. Es produziert XML-Tool-Calls jedoch stabil, wenn die Conversation-History XML enthält. Dieser Proxy erledigt die Übersetzung transparent — der Client sieht immer Standard-OpenAI-Format, das Modell immer XML.
+Viele Modelle unterstützen native OpenAI `tool_calls` nicht zuverlässig — sei es wegen fehlender Trainings-Daten oder Chat-Template-Eigenheiten. Solche Modelle produzieren XML-Tool-Calls jedoch stabil, wenn die Conversation-History XML enthält. Dieser Proxy erledigt die Übersetzung transparent — der Client sieht immer Standard-OpenAI-Format, das Modell immer XML.
 
 ## Flow
 
@@ -18,7 +27,7 @@ toolproxy :8007
   ├─ History normalisieren: tool_calls + role:tool → XML
   ├─ Priming injizieren (nur 1. Turn)
   ↓  Plain text request ohne tools[]
-oci-proxy :8005 → Oracle OCI GenAI
+Upstream LLM (OpenAI-kompatibler Endpoint)
   ↓  XML tool call in response (immer kanonische Namen)
 toolproxy
   ├─ XML parsen → OpenAI tool_calls (primär)
@@ -113,8 +122,8 @@ Reihenfolge beim Parsen der Modell-Antwort:
 
 | Env-Var | Default | Beschreibung |
 |---|---|---|
-| `UPSTREAM_URL` | `http://oci-proxy:8005/v1` | Upstream API-URL |
-| `UPSTREAM_MODEL` | `openai/gpt-oss-120b` | Modell-Name für Upstream |
+| `UPSTREAM_URL` | `http://localhost:8000/v1` | Upstream API-URL (OpenAI-kompatibel) |
+| `UPSTREAM_MODEL` | `your-model-name` | Modell-Name für Upstream |
 | `UPSTREAM_API_KEY` | `dummy-key` | API-Key für Upstream |
 | `REQUEST_TIMEOUT` | `180` | Timeout in Sekunden |
 | `MAX_RETRIES` | `2` | Wiederholungen bei Timeout |
@@ -151,7 +160,7 @@ Das Modell ignoriert Roo-Code-Mode-Instruktionen (Architect, Ask, etc.) und folg
 ### opencode
 ```json
 {
-  "model": "toolproxy/gpt-oss-120b",
+  "model": "toolproxy/your-model-name",
   "baseURL": "http://localhost:8007/v1"
 }
 ```
@@ -159,9 +168,9 @@ Das Modell ignoriert Roo-Code-Mode-Instruktionen (Architect, Ask, etc.) und folg
 ### Direkt via LiteLLM (empfohlen)
 ```yaml
 # litellm/config.yaml
-- model_name: openai/gpt-oss-120b-tools
+- model_name: openai/your-model-tools
   litellm_params:
-    model: openai/gpt-oss-120b
+    model: openai/your-model-name
     api_base: http://toolproxy:8007/v1
     api_key: dummy-key
 ```
@@ -179,7 +188,7 @@ curl http://localhost:8007/health
 curl -X POST http://localhost:8007/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-oss-120b",
+    "model": "your-model-name",
     "messages": [{"role": "user", "content": "Read the file README.md"}],
     "tools": [{
       "type": "function",
@@ -231,7 +240,7 @@ INFO  [abc12345] 3 tool calls → keeping only first ('write_to_file')
 ```
 
 ### Chat-Template-Leak ([assistant to=...] Format)
-Das OCI-Modell gibt gelegentlich seinen internen Chat-Template-Header aus statt XML:
+Das Modell gibt gelegentlich seinen internen Chat-Template-Header aus statt XML:
 - `[assistant to=write_file code<|message|>{...}` — FALSCH
 - `<assistant to=write_file code>{...}` — FALSCH
 
@@ -308,7 +317,7 @@ WARNING [abc12345] SUCCESS LOOP: 2 consecutive successful write operations — i
 ## Logs verstehen
 
 ```
-INFO  [abc12345] model=gpt-oss-120b messages=3 tools=12 client=open_code
+INFO  [abc12345] model=your-model-name messages=3 tools=12 client=open_code
 INFO  [abc12345] XML parsed 1 tool call(s)                               ← Normalfall
 INFO  [abc12345] XML alias: 'write_file' → 'write_to_file'               ← Tool-Name-Aliasing
 INFO  [abc12345] Partial XML rescue → write_to_file('Plan.md')           ← Abgeschnittener Response

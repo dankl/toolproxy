@@ -1,16 +1,16 @@
 """
 toolproxy — XML Tool Call Proxy
 
-Translates OpenAI native tool_calls API ↔ XML format that the OCI model
-(gpt-oss-120b) reliably produces. Sits between any OpenAI-compatible client
-and oci-proxy / LiteLLM.
+Translates OpenAI native tool_calls API ↔ XML format for models that do not
+support native function calls. Sits between any OpenAI-compatible client and
+any OpenAI-compatible upstream LLM (e.g. LiteLLM, vLLM, custom endpoints).
 
 Flow:
   Client (Roo Code, opencode, etc.)
     ↓  OpenAI JSON with tools[] array
   toolproxy (Port 8007)
     ↓  XML System Prompt + XML-normalised history
-  oci-proxy (8005) → Oracle OCI GenAI
+  Upstream LLM (OpenAI-compatible endpoint)
     ↓  XML tool call in response
   toolproxy — parses XML → OpenAI tool_calls
     ↑  Standard OpenAI response
@@ -833,7 +833,7 @@ def _parse_json_fallback(
 ) -> Optional[List[Dict]]:
     """
     JSON parsing cascade — used when XML parsing finds nothing.
-    Handles all the non-standard formats the OCI model occasionally falls back to.
+    Handles all the non-standard formats the model occasionally falls back to.
     """
     # [Tool Call: name]\n{args}
     if "[Tool Call:" in content:
@@ -1020,9 +1020,8 @@ async def chat_completions(request: Dict[str, Any]):
                 break
 
     # 4. Call upstream LLM (no native tools forwarded — model doesn't support them)
-    # OCI default is 2048 tokens — too small for large file writes. Use 8192 as minimum.
-    # Model stops naturally when done (~3-10k tokens measured); 8192 covers the natural range.
-    # (finish_reason is always "stop" from OCI even when truncated, so we can't detect it.)
+    # Default to 8192 tokens if not specified — many models have low defaults (e.g. 2048)
+    # which is too small for large file writes. Model stops naturally when done.
     response = await upstream_client.chat_completion(
         messages=messages,
         temperature=request.get("temperature", 0.7),

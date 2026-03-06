@@ -1,5 +1,5 @@
 """
-vLLM HTTP client with retry logic.
+Upstream LLM HTTP client with retry logic.
 """
 import httpx
 import asyncio
@@ -10,14 +10,14 @@ logger = logging.getLogger(__name__)
 
 
 class VLLMClient:
-    """HTTP client for vLLM API."""
+    """HTTP client for an OpenAI-compatible upstream LLM API."""
 
     def __init__(self, base_url: str, model: str, api_key: str = "dummy-key", timeout: int = 180, max_retries: int = 3):
         """
-        Initialize vLLM client.
+        Initialize upstream LLM client.
 
         Args:
-            base_url: vLLM API base URL
+            base_url: Upstream API base URL (OpenAI-compatible)
             model: Model name
             api_key: API key for authentication
             timeout: Request timeout in seconds
@@ -43,7 +43,7 @@ class VLLMClient:
         **kwargs
     ) -> Dict:
         """
-        Call vLLM chat completion API.
+        Call upstream chat completion API.
 
         Args:
             messages: List of chat messages
@@ -54,7 +54,7 @@ class VLLMClient:
             **kwargs: Additional parameters
 
         Returns:
-            Response dict from vLLM
+            Response dict from upstream
 
         Raises:
             httpx.HTTPError: If request fails after retries
@@ -72,11 +72,11 @@ class VLLMClient:
 
         if tools:
             payload["tools"] = tools
-            logger.debug(f"Added {len(tools)} tools to vLLM request")
+            logger.debug(f"Added {len(tools)} tools to upstream request")
 
         if tool_choice:
             payload["tool_choice"] = tool_choice
-            logger.debug(f"Added tool_choice to vLLM request: {tool_choice}")
+            logger.debug(f"Added tool_choice to upstream request: {tool_choice}")
 
         # Add any additional parameters
         payload.update(kwargs)
@@ -84,26 +84,26 @@ class VLLMClient:
         # Retry logic with exponential backoff
         for attempt in range(self.max_retries):
             try:
-                logger.debug(f"vLLM request attempt {attempt + 1}/{self.max_retries}")
+                logger.debug(f"upstream request attempt {attempt + 1}/{self.max_retries}")
                 logger.debug(f"Payload: {payload}")
 
                 response = await self.client.post(url, json=payload)
                 response.raise_for_status()
 
                 result = response.json()
-                logger.debug(f"vLLM response: {result}")
+                logger.debug(f"upstream response: {result}")
                 return result
 
             except httpx.TimeoutException as e:
-                logger.warning(f"vLLM timeout on attempt {attempt + 1}: {str(e)}")
+                logger.warning(f"upstream timeout on attempt {attempt + 1}: {str(e)}")
                 if attempt == self.max_retries - 1:
                     raise
                 # Exponential backoff
                 await asyncio.sleep(2 ** attempt)
 
             except httpx.HTTPStatusError as e:
-                logger.error(f"vLLM HTTP error {e.response.status_code}: {e.response.text}")
-                # Retry on 5xx (transient upstream errors, e.g. "OCI model returned an empty response")
+                logger.error(f"upstream HTTP error {e.response.status_code}: {e.response.text}")
+                # Retry on 5xx (transient upstream errors)
                 if e.response.status_code >= 500 and attempt < self.max_retries - 1:
                     wait = 2 ** attempt
                     logger.warning(f"Upstream 5xx — retrying in {wait}s (attempt {attempt + 1}/{self.max_retries})")
@@ -112,7 +112,7 @@ class VLLMClient:
                 raise
 
             except httpx.HTTPError as e:
-                logger.error(f"vLLM HTTP error on attempt {attempt + 1}: {str(e)}")
+                logger.error(f"upstream HTTP error on attempt {attempt + 1}: {str(e)}")
                 if attempt == self.max_retries - 1:
                     raise
                 await asyncio.sleep(2 ** attempt)
