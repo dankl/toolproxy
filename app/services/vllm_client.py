@@ -103,6 +103,12 @@ class VLLMClient:
 
             except httpx.HTTPStatusError as e:
                 logger.error(f"vLLM HTTP error {e.response.status_code}: {e.response.text}")
+                # Retry on 5xx (transient upstream errors, e.g. "OCI model returned an empty response")
+                if e.response.status_code >= 500 and attempt < self.max_retries - 1:
+                    wait = 2 ** attempt
+                    logger.warning(f"Upstream 5xx — retrying in {wait}s (attempt {attempt + 1}/{self.max_retries})")
+                    await asyncio.sleep(wait)
+                    continue
                 raise
 
             except httpx.HTTPError as e:

@@ -613,7 +613,11 @@ def detect_success_loop(messages: List[Dict], request_id: str = "") -> Optional[
 
     After normalization, Roo Code tool results arrive as role:user messages starting
     with '[Tool Result]'. If we see 2+ such success results in recent history for
-    write-type operations, the model is looping — inject a stop hint.
+    write-type operations WITHOUT an intervening genuine user instruction, the model
+    is looping — inject a stop hint.
+
+    The counter resets at each genuine user instruction (non-[Tool Result] message)
+    so that successful writes from a prior completed task don't block new edits.
     """
     recent = messages[-12:] if len(messages) > 12 else messages
     success_count = 0
@@ -623,10 +627,14 @@ def detect_success_loop(messages: List[Dict], request_id: str = "") -> Optional[
             continue
         content = str(msg.get("content", ""))
         if "[Tool Result]" not in content:
+            # Genuine user instruction → new task boundary, reset counter
+            logger.debug(f"[{request_id}] success_loop: reset at genuine user message")
+            success_count = 0
             continue
         lower = content.lower()
         if any(word in lower for word in _WRITE_SUCCESS_WORDS):
             success_count += 1
+            logger.debug(f"[{request_id}] success_loop: count={success_count}")
 
     if success_count < 2:
         return None
@@ -797,15 +805,27 @@ async def chat_completions(request: Dict[str, Any]) -> Dict[str, Any]:
                 break
 
     # 4. Call upstream LLM (no native tools forwarded — model doesn't support them)
+    # OCI default is 2048 tokens — too small for large file writes. Use 8192 as minimum.
+    # Model stops naturally when done (~3-10k tokens measured); 8192 covers the natural range.
+    # (finish_reason is always "stop" from OCI even when truncated, so we can't detect it.)
     response = await upstream_client.chat_completion(
         messages=messages,
         temperature=request.get("temperature", 0.7),
-        max_tokens=request.get("max_tokens"),
+        max_tokens=request.get("max_tokens") or 8192,
     )
 
     assistant_message = response["choices"][0]["message"]
     content: str = assistant_message.get("content") or ""
     tool_calls: Optional[List[Dict]] = assistant_message.get("tool_calls")
+
+    # Log raw model output so wrong/unexpected content is visible in logs
+    if content:
+        preview = content[:300].replace("\n", "\\n")
+        logger.info(
+            f"[{request_id}] model output ({len(content)} chars): {preview}"
+            f"{'…' if len(content) > 300 else ''}"
+        )
+        logger.debug(f"[{request_id}] model output full:\n{content}")
 
     # 5. PRIMARY: XML parsing
     if not tool_calls and content and tool_names:

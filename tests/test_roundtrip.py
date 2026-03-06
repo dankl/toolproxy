@@ -647,9 +647,11 @@ class TestRoundtrip:
 class TestSuccessLoopDetection:
     def test_stop_hint_injected_after_two_successful_writes(self, client, llm):
         """
-        If the conversation history contains 2+ successful [Tool Result] messages
-        for write operations, a CORRECTION / STOP hint must be appended to the
-        last user message before calling the LLM.
+        Model is looping: 2 successful write tool results with NO genuine user
+        instruction in between. The stop hint must be injected.
+
+        The history ends with tool results — no new user message — which is exactly
+        how Roo Code sends requests when the model loops without user intervention.
         """
         captured = []
 
@@ -661,7 +663,8 @@ class TestSuccessLoopDetection:
 
         llm.side_effect = side_effect
 
-        # Build a history with two successful write results already in place
+        # History: user starts task, model writes 2 files, history ends with
+        # the second tool result (no follow-up user message = looping model)
         messages = [
             SYSTEM_MSG,
             user_msg("Write three files."),
@@ -677,7 +680,7 @@ class TestSuccessLoopDetection:
                              "arguments": '{"path":"b.py","content":"y"}'},
             }]),
             _tool_result_msg("call_2", "File written successfully: b.py"),
-            user_msg("Continue please."),
+            # No genuine user message here — the model is trying to call a tool again
         ]
 
         resp = client.post("/v1/chat/completions", json={
@@ -694,6 +697,67 @@ class TestSuccessLoopDetection:
         assert last_user is not None
         content = last_user["content"]
         assert "[CORRECTION]" in content or "STOP" in content
+
+    def test_stop_hint_reset_by_new_user_instruction(self, client, llm):
+        """
+        Regression: a genuine user instruction after two successful writes must
+        reset the loop counter. The stop hint must NOT fire, so the model can
+        make the requested edit.
+
+        This was the original bug: the user asked "Add the section" after a
+        completed task and the proxy injected a stop hint, causing the model to
+        report success without actually editing the file.
+        """
+        captured = []
+
+        async def side_effect(messages=None, **kwargs):
+            captured.extend(messages or [])
+            return llm_response(
+                "<write_to_file><path>guide.md</path><content>## New section\n\nContent here.</content></write_to_file>"
+            )
+
+        llm.side_effect = side_effect
+
+        # History: task A finished with 2 writes, then the user requests a NEW edit
+        messages = [
+            SYSTEM_MSG,
+            user_msg("Write two files."),
+            _assistant_tool_call_msg([{
+                "id": "call_1", "type": "function",
+                "function": {"name": "write_to_file",
+                             "arguments": '{"path":"a.py","content":"x"}'},
+            }]),
+            _tool_result_msg("call_1", "File written successfully: a.py"),
+            _assistant_tool_call_msg([{
+                "id": "call_2", "type": "function",
+                "function": {"name": "write_to_file",
+                             "arguments": '{"path":"b.py","content":"y"}'},
+            }]),
+            _tool_result_msg("call_2", "File written successfully: b.py"),
+            # Genuine new user instruction — resets the loop counter
+            user_msg("The file has no changes. Add the section."),
+        ]
+
+        resp = client.post("/v1/chat/completions", json={
+            "model": "test-model",
+            "messages": messages,
+            "tools": DEFAULT_TOOLS,
+        })
+        assert resp.status_code == 200
+
+        last_user = next(
+            (m for m in reversed(captured) if m.get("role") == "user"), None
+        )
+        assert last_user is not None
+        # Stop hint must NOT be present — user gave a new instruction
+        content = last_user["content"]
+        assert "[CORRECTION]" not in content
+        assert "STOP" not in content
+
+        # Model should have been allowed to write
+        data = resp.json()
+        tool_calls = data["choices"][0]["message"]["tool_calls"]
+        assert tool_calls and tool_calls[0]["function"]["name"] == "write_to_file"
 
     def test_no_stop_hint_with_only_one_successful_write(self, client, llm):
 
@@ -948,3 +1012,147 @@ class TestJokeApiScenario:
         assert "getWitz" in args2["content"]
         assert "&&" in args2["content"]
         assert "=>" in args2["content"]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Regression: prose + code-block response (model skips XML and describes file)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Reproduces the exact second-turn failure from [67551cb0]:
+#   User asks to add a section to guides/ai-guide.md.
+#   Model answers with German prose + a ```markdown code block instead of XML.
+#   Without VSCode Open Tabs the proxy cannot determine the target file and
+#   falls back to attempt_completion — the file is never updated.
+#
+# These tests document the current proxy-level behaviour so we catch regressions
+# if the synthesis logic changes.  The REAL fix is the system-prompt improvement
+# that makes the model less likely to produce this format in the first place.
+
+_PROSE_CODEBLOCK_RESPONSE = (
+    "Hier ist der aktualisierte **guides/ai-guide.md** mit einem kurzen "
+    "Abschnitt zu RagFlow am Ende (maximal 5 Sätze):\n\n"
+    "```markdown\n"
+    "# AI Guide — AgentGarage\n\n"
+    "Eine kurze Übersicht der verfügbaren KI-Dienste und wie du sie nutzt.\n\n"
+    "---\n\n"
+    "## Das Modell\n\n"
+    "AgentGarage betreibt ein selbst-gehostetes Large Language Model.\n\n"
+    "## RagFlow\n\n"
+    "RagFlow ist eine Open-Source RAG-Engine für Dokumentensuche.\n"
+    "```"
+)
+
+
+class TestProseCodeBlockResponse:
+    """
+    Model ignores XML format and instead describes the file content in prose
+    with a markdown code block — e.g. 'Hier ist der aktualisierte file.md: ```...```'.
+    """
+
+    def test_no_tabs_falls_back_to_attempt_completion(self, client, llm):
+        """
+        Without a VSCode Open Tabs hint the proxy cannot determine the target
+        file → falls back to attempt_completion instead of write_to_file.
+
+        This is the exact failure from log [67551cb0].  The test documents the
+        current limitation: system-prompt improvements reduce the frequency but
+        the proxy itself has no code-level fix for this case yet.
+        """
+        llm.return_value = llm_response(_PROSE_CODEBLOCK_RESPONSE)
+        resp = client.post("/v1/chat/completions", json={
+            "model": "test-model",
+            "messages": [
+                SYSTEM_MSG,
+                # No "# VSCode Open Tabs" section → _extract_target_file returns None
+                user_msg("Füge einen kurzen Abschnitt zu RagFlow in guides/ai-guide.md ein."),
+            ],
+            "tools": DEFAULT_TOOLS,
+        })
+        assert resp.status_code == 200
+        name, _ = parse_tool_call(resp.json())
+        # Current behaviour: falls through to attempt_completion because
+        # target file cannot be determined from context alone.
+        assert name == "attempt_completion", (
+            f"Expected attempt_completion (known limitation), got '{name}'. "
+            "If this is now write_to_file, update the test — the proxy was improved!"
+        )
+
+    def test_with_tabs_synthesizes_write_to_file(self, client, llm):
+        """
+        With a VSCode Open Tabs hint pointing at guides/ai-guide.md the proxy
+        CAN determine the target file and synthesizes write_to_file.
+
+        Note: the synthesized content includes the prose preamble — not ideal,
+        but better than attempt_completion (file is at least written).
+        """
+        llm.return_value = llm_response(_PROSE_CODEBLOCK_RESPONSE)
+        resp = client.post("/v1/chat/completions", json={
+            "model": "test-model",
+            "messages": [
+                SYSTEM_MSG,
+                user_msg(
+                    "Füge einen kurzen Abschnitt zu RagFlow in guides/ai-guide.md ein.\n\n"
+                    "# VSCode Open Tabs\nguides/ai-guide.md\n\n"
+                ),
+            ],
+            "tools": DEFAULT_TOOLS,
+        })
+        assert resp.status_code == 200
+        name, args = parse_tool_call(resp.json())
+        assert name == "write_to_file", (
+            f"Expected write_to_file when Open Tabs contains the target, got '{name}'"
+        )
+        assert args["path"] == "guides/ai-guide.md"
+        assert "RagFlow" in args["content"]
+
+    def test_multi_turn_prose_codeblock_in_second_turn(self, client, llm):
+        """
+        Full two-turn reproduction of [d30af879] + [67551cb0]:
+
+          Turn 1: model correctly outputs <write_to_file> XML → file created.
+          Turn 2: model ignores XML format, returns prose + code block.
+                  No VSCode tabs in the second user message → attempt_completion.
+
+        This is the exact session that triggered the system-prompt improvement.
+        """
+        # ── TURN 1: correct XML ────────────────────────────────────────────
+        llm.return_value = llm_response(
+            "<write_to_file>"
+            "<path>guides/ai-guide.md</path>"
+            "<content># AI Guide — AgentGarage\n\nEine kurze Übersicht.</content>"
+            "</write_to_file>"
+        )
+        t1_msgs = [SYSTEM_MSG, user_msg("Erstelle guides/ai-guide.md")]
+        r1 = client.post("/v1/chat/completions", json={
+            "model": "test-model", "messages": t1_msgs, "tools": DEFAULT_TOOLS,
+        })
+        assert r1.status_code == 200
+        name1, _ = parse_tool_call(r1.json())
+        assert name1 == "write_to_file"
+        tc1 = r1.json()["choices"][0]["message"]["tool_calls"][0]
+
+        # ── TURN 2: model returns prose + code block instead of XML ────────
+        llm.return_value = llm_response(_PROSE_CODEBLOCK_RESPONSE)
+        t2_msgs = [
+            *t1_msgs,
+            _assistant_tool_call_msg(r1.json()["choices"][0]["message"]["tool_calls"]),
+            _tool_result_msg(tc1["id"], "File written successfully: guides/ai-guide.md"),
+            # Note: no VSCode Open Tabs hint → proxy cannot find target file
+            user_msg("Füge einen kurzen RagFlow-Abschnitt am Ende hinzu."),
+        ]
+        r2 = client.post("/v1/chat/completions", json={
+            "model": "test-model", "messages": t2_msgs, "tools": DEFAULT_TOOLS,
+        })
+        assert r2.status_code == 200
+        name2, _ = parse_tool_call(r2.json())
+        # Proxy falls back to attempt_completion — file is NOT updated.
+        # The system-prompt improvement makes this scenario less likely to occur.
+        assert name2 == "attempt_completion", (
+            f"Turn 2: expected attempt_completion (known limitation), got '{name2}'"
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# YAML-like tool call format
+# ──────────────────────────────────────────────────────────────────────────────
+

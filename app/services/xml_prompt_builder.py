@@ -59,7 +59,11 @@ Example:
 1. Your ENTIRE response must be exactly one XML tool call — nothing else
 2. Use ONLY tool names from the list above
 3. Name corrections: `write_file` → `write_to_file` | `open_file` → `read_file` | `apply_patch` → `apply_diff`
-4. To CREATE a new file: use `write_to_file`. To MODIFY an existing file: use `apply_diff`
+4. To CREATE a new file: use `write_to_file` with the COMPLETE file content.
+   To MODIFY an existing file:
+   - First call `read_file` to get the current content
+   - Then use `apply_diff` to change specific sections, OR `write_to_file` with the COMPLETE updated content
+   - NEVER use `write_to_file` with only the new/changed portion — this destroys existing content
 5. NEVER output file content as plain text — always call the tool
 6. When the task is complete, call `attempt_completion`
    → A task is ONLY complete when ALL required files exist on disk.
@@ -73,7 +77,66 @@ NEVER use any of these formats — they will be ignored:
 - `[assistant to=write_to_file code<|message|>{{...}}` — WRONG
 - `<assistant to=write_to_file code>{{...}}` — WRONG
 - JSON objects like `{{"tool": "name", "parameters": {{...}}}}` — WRONG
+- YAML-style like `[write_to_file]\npath: foo\ncontent: |` — WRONG
 - Plain text descriptions of what you would do — WRONG
+- Describing updated file content in a code block — WRONG (see example below)
+
+## CRITICAL EXAMPLE — updating a file
+
+WRONG (never do this):
+```
+Hier ist der aktualisierte guides/ai-guide.md:
+```markdown
+# AI Guide
+...
+```
+```
+
+CORRECT (always do this):
+```
+<write_to_file>
+<path>guides/ai-guide.md</path>
+<content># AI Guide
+...
+</content>
+</write_to_file>
+```
+
+No matter what language you think in — your ENTIRE response must be the XML tool call. No preamble, no explanation, no code fences around the XML.
+
+## CRITICAL EXAMPLE — adding content to an existing file
+
+WRONG (never do this — overwrites the entire file with only the new part):
+```
+<write_to_file>
+<path>guides/ai-guide.md</path>
+<content>## RagFlow
+
+Only the new section...
+</content>
+</write_to_file>
+```
+
+CORRECT option 1 — read the file first, then write the COMPLETE updated content:
+```
+<read_file>
+<path>guides/ai-guide.md</path>
+</read_file>
+```
+[after seeing the current content, call write_to_file with the FULL file including the new section]
+
+CORRECT option 2 — use apply_diff to append a section:
+```
+<apply_diff>
+<path>guides/ai-guide.md</path>
+<diff>
+@@ ... @@
++## RagFlow
++
++New section content here...
+</diff>
+</apply_diff>
+```
 
 ====
 

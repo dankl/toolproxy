@@ -49,6 +49,11 @@ TOOL_LIST_FILES = _tool(
     {"path": {"type": "string", "description": "Directory path"}},
     ["path"],
 )
+TOOL_APPEND_TO_FILE = _tool(
+    "append_to_file", "Append content to an existing file",
+    {"path": {"type": "string"}, "content": {"type": "string"}},
+    ["path", "content"],
+)
 TOOL_ATTEMPT_COMPLETION = _tool(
     "attempt_completion", "Signal task completion with a summary",
     {"result": {"type": "string"}},
@@ -57,6 +62,7 @@ TOOL_ATTEMPT_COMPLETION = _tool(
 
 DEFAULT_TOOLS = [
     TOOL_WRITE_TO_FILE,
+    TOOL_APPEND_TO_FILE,
     TOOL_READ_FILE,
     TOOL_APPLY_DIFF,
     TOOL_LIST_FILES,
