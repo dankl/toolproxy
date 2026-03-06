@@ -12,18 +12,58 @@ Das OCI-Modell (`gpt-oss-120b`) unterstützt native OpenAI `tool_calls` nicht zu
 Client (Roo Code / opencode / curl)
   ↓  OpenAI JSON: messages + tools[]
 toolproxy :8007
+  ├─ Client erkennen (Roo Code / OpenCode / Generic)
+  ├─ Tool-Namen kanonisieren (OpenCode: write→write_to_file, read→read_file)
   ├─ System-Prompt: XML-Tool-Definitionen ergänzen
   ├─ History normalisieren: tool_calls + role:tool → XML
   ├─ Priming injizieren (nur 1. Turn)
   ↓  Plain text request ohne tools[]
 oci-proxy :8005 → Oracle OCI GenAI
-  ↓  XML tool call in response
+  ↓  XML tool call in response (immer kanonische Namen)
 toolproxy
   ├─ XML parsen → OpenAI tool_calls (primär)
   ├─ Partial XML rescue (abgeschnittene Responses)
-  └─ JSON-Fallback-Kaskade (wenn kein XML gefunden)
+  ├─ JSON-Fallback-Kaskade (wenn kein XML gefunden)
+  ├─ Text-Synthesis (Prosa → write_to_file / attempt_completion)
+  ├─ Schema-Remap: <path> → filePath (OpenCode)
+  └─ Tool-Namen dekanonisieren (write_to_file→write, read_file→read für OpenCode)
   ↑  Standard OpenAI response mit tool_calls[]
 Client
+```
+
+## Tool-Mapping: Client ↔ LLM (kanonisch)
+
+Das Modell spricht immer **kanonische Tool-Namen** (ROO-Code-Stil). Client-spezifische Namen werden beim Eingang übersetzt und beim Ausgang zurückübersetzt — transparent für beide Seiten.
+
+| OpenCode (Client) | LLM (kanonisch) | Roo Code (Client) | Mapping |
+|---|---|---|---|
+| `read` | `read_file` | `read_file` | ✅ übersetzt |
+| `write` | `write_to_file` | `write_to_file` | ✅ übersetzt |
+| `edit` | `edit` | *(kein Äquivalent)* | — passthrough |
+| `bash` | `bash` | *(kein Äquivalent)* | — passthrough |
+| `glob` | `glob` | *(kein Äquivalent)* | — passthrough |
+| `grep` | `grep` | *(kein Äquivalent)* | — passthrough |
+| `question` | `question` | *(kein Äquivalent)* | — passthrough |
+| `task` | `task` | *(kein Äquivalent)* | — passthrough |
+| `webfetch` | `webfetch` | *(kein Äquivalent)* | — passthrough |
+| `todowrite` | `todowrite` | *(kein Äquivalent)* | — passthrough |
+| `skill` | `skill` | *(kein Äquivalent)* | — passthrough |
+| *(kein Äquivalent)* | `apply_diff` | `apply_diff` | — nur Roo |
+| *(kein Äquivalent)* | `attempt_completion` | `attempt_completion` | — nur Roo |
+| *(kein Äquivalent)* | `list_files` | `list_files` | — nur Roo |
+| *(kein Äquivalent)* | `execute_command` | `execute_command` | — nur Roo |
+
+**Parameter-Mapping** (zusätzlich, via Schema-Remap):
+
+| LLM-Output (kanonisch) | OpenCode-Schema | Roo-Schema |
+|---|---|---|
+| `<path>` in `write_to_file` | → `filePath` | → `path` |
+| `<path>` in `read_file` | → `filePath` | → `path` |
+
+Im Log sichtbar als:
+```
+INFO  [abc12345] Decanonicalize: 'write_to_file' → 'write'
+INFO  [abc12345] Schema remap write_to_file: 'path' → 'filePath'
 ```
 
 ## Kernmechanismen
@@ -268,7 +308,7 @@ WARNING [abc12345] SUCCESS LOOP: 2 consecutive successful write operations — i
 ## Logs verstehen
 
 ```
-INFO  [abc12345] model=gpt-oss-120b messages=3 tools=12
+INFO  [abc12345] model=gpt-oss-120b messages=3 tools=12 client=open_code
 INFO  [abc12345] XML parsed 1 tool call(s)                               ← Normalfall
 INFO  [abc12345] XML alias: 'write_file' → 'write_to_file'               ← Tool-Name-Aliasing
 INFO  [abc12345] Partial XML rescue → write_to_file('Plan.md')           ← Abgeschnittener Response
@@ -277,6 +317,8 @@ INFO  [abc12345] apply_diff all-additions on 'Main.java' → write_to_file ← D
 INFO  [abc12345] 3 tool calls → keeping only first ('write_to_file')     ← Multi-Call Limit
 INFO  [abc12345] Text response looks like file content → synthesizing write_to_file(...)  ← Text-Synthesis
 INFO  [abc12345] Text response → synthesizing attempt_completion fallback ← Synthesis-Fallback
+INFO  [abc12345] Schema remap write_to_file: 'path' → 'filePath'         ← Parameter-Remap (OpenCode)
+INFO  [abc12345] Decanonicalize: 'write_to_file' → 'write'               ← Tool-Name zurückübersetzen
 INFO  [abc12345] No tool calls found — returning text response           ← Reine Textantwort
 WARNING [abc12345] SUCCESS LOOP: 2 consecutive successful write operations — injecting stop hint
 ```

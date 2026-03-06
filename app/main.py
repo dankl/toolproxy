@@ -19,12 +19,14 @@ Flow:
 import json
 import logging
 import re
+import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional
+from enum import Enum
+from typing import Any, AsyncIterator, Dict, List, Optional
 
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.config import settings
 from app.services.json_repair import safe_parse_json
@@ -42,6 +44,79 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Client type detection
+# ---------------------------------------------------------------------------
+
+
+class ClientType(Enum):
+    ROO_CODE = "roo_code"
+    OPEN_CODE = "open_code"
+    GENERIC = "generic"
+
+
+_ROO_CODE_SIGNALS = frozenset({"attempt_completion", "write_to_file", "read_file", "apply_diff"})
+_OPEN_CODE_SIGNALS = frozenset({"bash", "edit", "glob", "grep"})
+
+# Canonical tool name mapping.
+# The model always sees and outputs ROO_CODE-style tool names (canonical).
+# For OpenCode clients we translate incoming names → canonical before sending to the model,
+# then translate canonical names → client names in the response.
+# Only tools with equivalent semantics are mapped; edit/bash/glob/grep etc. stay as-is.
+_OPEN_CODE_TO_CANONICAL: Dict[str, str] = {
+    "write": "write_to_file",
+    "read": "read_file",
+}
+_CANONICAL_TO_OPEN_CODE: Dict[str, str] = {v: k for k, v in _OPEN_CODE_TO_CANONICAL.items()}
+
+
+def detect_client_type(tool_names: List[str]) -> ClientType:
+    """Identify which agent framework is making the request based on its tool set."""
+    names = set(tool_names)
+    if names & _ROO_CODE_SIGNALS:
+        return ClientType.ROO_CODE
+    if names & _OPEN_CODE_SIGNALS:
+        return ClientType.OPEN_CODE
+    return ClientType.GENERIC
+
+
+def _canonicalize_tools(tools: List[Dict], client_type: ClientType) -> List[Dict]:
+    """Rename client-specific tool names to canonical (ROO_CODE-style) names.
+
+    The model always speaks the canonical XML language. Client-specific names
+    are translated here before the request is sent to the model.
+    """
+    if client_type != ClientType.OPEN_CODE:
+        return tools
+    result = []
+    for t in tools:
+        func = t.get("function", {})
+        name = func.get("name", "")
+        canonical = _OPEN_CODE_TO_CANONICAL.get(name)
+        if canonical:
+            t = {**t, "function": {**func, "name": canonical}}
+        result.append(t)
+    return result
+
+
+def _decanonicalize_tool_calls(
+    tool_calls: List[Dict], client_type: ClientType, request_id: str
+) -> List[Dict]:
+    """Translate canonical tool names back to client-specific names before returning."""
+    if client_type != ClientType.OPEN_CODE:
+        return tool_calls
+    result = []
+    for tc in tool_calls:
+        func = tc.get("function", {})
+        name = func.get("name", "")
+        client_name = _CANONICAL_TO_OPEN_CODE.get(name)
+        if client_name:
+            logger.info(f"[{request_id}] Decanonicalize: {name!r} → {client_name!r}")
+            tc = {**tc, "function": {**func, "name": client_name}}
+        result.append(tc)
+    return result
+
 
 # ---------------------------------------------------------------------------
 # Tool name / argument recovery helpers (same approach as roocode-proxy)
@@ -63,6 +138,63 @@ _PARAM_ALIASES: Dict[str, str] = {
     "cmd": "command",
     "shell": "command",
 }
+
+# Schema-aware parameter aliases: model output key → schema key.
+# Applied post-parsing when the model uses the canonical priming name (e.g. "path")
+# but the actual tool schema uses a different name (e.g. "filePath").
+# Only fires when the output key is NOT in the schema AND the target IS —
+# so this is purely schema-driven, not client-specific.
+# Known real-world case: OpenCode's "write" tool uses "filePath" instead of "path".
+_SCHEMA_PARAM_ALIASES: Dict[str, str] = {
+    "path": "filePath",
+    "filePath": "path",
+}
+
+
+def _remap_args_to_schema(
+    tool_calls: List[Dict], tools: List[Dict], request_id: str
+) -> List[Dict]:
+    """
+    Rename tool call arguments to match the actual tool schema.
+
+    When the model outputs canonical priming params (e.g. <path>) but the client's
+    tool schema uses a different name (e.g. filePath for OpenCode's write tool),
+    this function detects the mismatch and renames via _SCHEMA_PARAM_ALIASES.
+    """
+    tool_map = {
+        t.get("function", {}).get("name", ""): t.get("function", {})
+        for t in tools if t.get("function", {}).get("name")
+    }
+    result = []
+    for tc in tool_calls:
+        func = tc.get("function", {})
+        name = func.get("name", "")
+        tool_def = tool_map.get(name)
+        if not tool_def:
+            result.append(tc)
+            continue
+        schema_params = set(tool_def.get("parameters", {}).get("properties", {}).keys())
+        try:
+            args = json.loads(func.get("arguments", "{}"))
+        except (json.JSONDecodeError, TypeError):
+            result.append(tc)
+            continue
+        remapped = {}
+        changed = False
+        for key, value in args.items():
+            if key not in schema_params:
+                target = _SCHEMA_PARAM_ALIASES.get(key)
+                if target and target in schema_params:
+                    logger.info(f"[{request_id}] Schema remap {name}: {key!r} → {target!r}")
+                    remapped[target] = value
+                    changed = True
+                    continue
+            remapped[key] = value
+        if changed:
+            tc = {**tc, "function": {**func, "arguments": json.dumps(remapped, ensure_ascii=False)}}
+        result.append(tc)
+    return result
+
 
 # Hallucinated tool name → real tool name
 _TOOL_NAME_ALIASES: Dict[str, str] = {
@@ -293,30 +425,50 @@ def _normalize_messages(messages: List[Dict], request_id: str) -> List[Dict]:
 
 
 def _make_prime_xml(tool_name: str, params: Dict, required: List[str]) -> str:
-    """Build a plausible single-line XML example call for a tool."""
-    if "path" in params:
+    """Build a plausible XML example call for a tool.
+
+    Always uses <path> as the canonical path parameter — even for tools that use
+    'filePath' in their schema. The schema-aware remapping (_remap_args_to_schema)
+    translates back to the correct name after parsing, so the model learns one
+    consistent XML convention.
+    """
+    has_path = "path" in params or "filePath" in params
+    if has_path and "content" in params:
+        return f"<{tool_name}>\n<path>example.md</path>\n<content>example content</content>\n</{tool_name}>"
+    if has_path:
         return f"<{tool_name}>\n<path>README.md</path>\n</{tool_name}>"
-    if "content" in params and "path" in params:
-        return f"<{tool_name}>\n<path>README.md</path>\n<content>example content</content>\n</{tool_name}>"
     param = required[0] if required else (list(params.keys())[0] if params else "input")
     return f"<{tool_name}>\n<{param}>example</{param}>\n</{tool_name}>"
 
 
-def _inject_priming(messages: List[Dict], tools: List[Dict]) -> List[Dict]:
+_PRIMING_PREFERRED: Dict[str, List[str]] = {
+    ClientType.ROO_CODE.value: ["read_file", "write_to_file", "attempt_completion"],
+    ClientType.OPEN_CODE.value: ["read_file", "write_to_file", "bash"],
+    ClientType.GENERIC.value: [],
+}
+
+_PRIMING_QUESTIONS: Dict[str, List[str]] = {
+    ClientType.ROO_CODE.value: [
+        "What files are in this project?",
+        "Please write the implementation.",
+        "Are you done?",
+    ],
+    ClientType.OPEN_CODE.value: [
+        "What does the README say?",
+        "Please create the file.",
+        "Run the tests.",
+    ],
+}
+
+
+def _inject_priming(messages: List[Dict], tools: List[Dict], client_type: ClientType = ClientType.ROO_CODE) -> List[Dict]:
     """
     Inject up to 3 synthetic (question, XML-answer) pairs before the first user
     message when the conversation has only 1 user turn.
 
-    Three examples cover all major tool categories the model will encounter:
-      1. read_file   — shows a read/query tool call
-      2. write_to_file — shows a write/create tool call
-      3. attempt_completion — shows how to finish
-
+    Three examples cover all major tool categories the model will encounter.
     More examples = stronger XML-format prior, suppressing the model's own
     chat-template format leak ([assistant to=...] / <assistant to=...>).
-
-    Roo Code is always multi-turn after turn 1, so this mainly helps for
-    direct API tests and tools like opencode on first contact.
     """
     user_msgs = [m for m in messages if m.get("role") == "user"]
     if len(user_msgs) != 1 or not tools:
@@ -329,11 +481,14 @@ def _inject_priming(messages: List[Dict], tools: List[Dict]) -> List[Dict]:
         if n:
             tool_map[n] = fn
 
+    preferred = _PRIMING_PREFERRED.get(client_type.value, [])
+    questions = _PRIMING_QUESTIONS.get(client_type.value, _PRIMING_QUESTIONS[ClientType.ROO_CODE.value])
+
     # Select up to 3 representative tools in priority order
     candidates = []
-    for preferred in ("read_file", "write_to_file", "attempt_completion"):
-        if preferred in tool_map:
-            candidates.append(preferred)
+    for preferred_name in preferred:
+        if preferred_name in tool_map:
+            candidates.append(preferred_name)
     # Fill remaining slots from whatever tools are available
     for name in tool_map:
         if name not in candidates:
@@ -341,11 +496,7 @@ def _inject_priming(messages: List[Dict], tools: List[Dict]) -> List[Dict]:
         if len(candidates) >= 3:
             break
 
-    prime_qa = [
-        ("What files are in this project?", "read_file"),
-        ("Please write the implementation.", "write_to_file"),
-        ("Are you done?", "attempt_completion"),
-    ]
+    prime_qa = list(zip(questions, preferred or candidates))
 
     priming: List[Dict] = []
     for (question, _), tool_name in zip(prime_qa, candidates):
@@ -607,7 +758,7 @@ def _convert_new_file_diffs(
 _WRITE_SUCCESS_WORDS = ("successfully", "appended", "created", "written", "modified", "updated")
 
 
-def detect_success_loop(messages: List[Dict], request_id: str = "") -> Optional[str]:
+def detect_success_loop(messages: List[Dict], request_id: str = "", client_type: ClientType = ClientType.ROO_CODE) -> Optional[str]:
     """
     Detect when write-type tools keep succeeding but the model keeps calling them again.
 
@@ -643,6 +794,12 @@ def detect_success_loop(messages: List[Dict], request_id: str = "") -> Optional[
         f"[{request_id}] SUCCESS LOOP: {success_count} consecutive successful "
         f"write operations — injecting stop hint"
     )
+    if client_type == ClientType.OPEN_CODE:
+        return (
+            f"STOP: The file operation has already succeeded {success_count} times. "
+            "Do NOT repeat the tool call — you are creating duplicates. "
+            "The task is done — respond with a brief plain-text summary."
+        )
     return (
         f"STOP: The file operation has already succeeded {success_count} times. "
         "Do NOT repeat the tool call — you are creating duplicates. "
@@ -757,19 +914,77 @@ def _parse_json_fallback(
 
 
 # ---------------------------------------------------------------------------
+# SSE streaming helpers
+# ---------------------------------------------------------------------------
+
+
+def _sse_chunk(data: Dict) -> str:
+    return f"data: {json.dumps(data)}\n\n"
+
+
+async def _stream_response(
+    response_id: str,
+    created: int,
+    model: str,
+    message: Dict[str, Any],
+    finish_reason: str,
+    usage: Dict,
+) -> AsyncIterator[str]:
+    """
+    Emit the fully-processed response as SSE chunks.
+
+    We always process the complete response first (XML parsing, synthesis, etc.),
+    then fake-stream it — necessary because toolproxy needs the full model output
+    to do XML→tool_call conversion before the client sees anything.
+    """
+    base = {"id": response_id, "object": "chat.completion.chunk", "created": created, "model": model}
+    tool_calls = message.get("tool_calls")
+    content = message.get("content", "") or ""
+
+    # Chunk 1: role
+    yield _sse_chunk({**base, "choices": [{"index": 0, "delta": {"role": "assistant", "content": None}, "finish_reason": None}]})
+
+    if tool_calls:
+        # Chunk 2: tool call header (name + id, no arguments yet)
+        tc = tool_calls[0]
+        yield _sse_chunk({**base, "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": tc["id"], "type": "function", "function": {"name": tc["function"]["name"], "arguments": ""}}]}, "finish_reason": None}]})
+        # Chunk 3: arguments
+        args_str = tc["function"].get("arguments", "")
+        if args_str:
+            yield _sse_chunk({**base, "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": args_str}}]}, "finish_reason": None}]})
+        # Chunk 4: finish
+        yield _sse_chunk({**base, "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}], "usage": usage})
+    else:
+        # Text response — send content as one chunk
+        if content:
+            yield _sse_chunk({**base, "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}]})
+        yield _sse_chunk({**base, "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}], "usage": usage})
+
+    yield "data: [DONE]\n\n"
+
+
+# ---------------------------------------------------------------------------
 # Main endpoint
 # ---------------------------------------------------------------------------
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: Dict[str, Any]) -> Dict[str, Any]:
+async def chat_completions(request: Dict[str, Any]):
     request_id = str(uuid.uuid4())[:8]
+    stream = bool(request.get("stream", False))
     request_tools = request.get("tools", [])
     tool_names = extract_tool_names_from_request(request_tools)
+    client_type = detect_client_type(tool_names)
+
+    # Translate client-specific tool names to canonical (ROO_CODE-style) names.
+    # The model always speaks the canonical XML language; we translate back on the way out.
+    canonical_tools = _canonicalize_tools(request_tools, client_type)
+    tool_names = [t.get("function", {}).get("name", "") for t in canonical_tools if t.get("function")]
 
     logger.info(
         f"[{request_id}] model={request.get('model', 'N/A')} "
-        f"messages={len(request.get('messages', []))} tools={len(request_tools)}"
+        f"messages={len(request.get('messages', []))} tools={len(request_tools)} "
+        f"client={client_type.value}"
     )
     if settings.log_level == "DEBUG":
         logger.debug(f"[{request_id}] Full request: {json.dumps(request, indent=2, default=str)}")
@@ -785,18 +1000,18 @@ async def chat_completions(request: Dict[str, Any]) -> Dict[str, Any]:
         existing_system = messages[0]["content"]
         messages = messages[1:]
 
-    if request_tools:
-        xml_system = build_xml_system_prompt(request_tools, existing_system)
+    if canonical_tools:
+        xml_system = build_xml_system_prompt(canonical_tools, existing_system, client_type)
         messages = [{"role": "system", "content": xml_system}] + messages
     elif existing_system:
         messages = [{"role": "system", "content": existing_system}] + messages
 
     # 3. Inject priming pair for single-turn conversations
-    if request_tools:
-        messages = _inject_priming(messages, request_tools)
+    if canonical_tools:
+        messages = _inject_priming(messages, canonical_tools, client_type)
 
     # 3b. Loop detection — append stop hint to last user message if model is looping
-    loop_hint = detect_success_loop(messages, request_id)
+    loop_hint = detect_success_loop(messages, request_id, client_type)
     if loop_hint:
         for i in range(len(messages) - 1, -1, -1):
             if messages[i].get("role") == "user":
@@ -850,25 +1065,31 @@ async def chat_completions(request: Dict[str, Any]) -> Dict[str, Any]:
 
     # 6. FALLBACK: JSON cascade
     if not tool_calls and content:
-        tool_calls = _parse_json_fallback(content, request_tools, tool_names, request_id)
+        tool_calls = _parse_json_fallback(content, canonical_tools, tool_names, request_id)
         if tool_calls:
             assistant_message["tool_calls"] = tool_calls
             assistant_message["content"] = ""
 
     # 7. TEXT-SYNTHESIS: convert prose response to write_to_file / attempt_completion
-    if not tool_calls and content and request_tools:
-        tool_calls = _synthesize_tool_call_from_text(content, messages, request_tools, request_id)
+    if not tool_calls and content and canonical_tools:
+        tool_calls = _synthesize_tool_call_from_text(content, messages, canonical_tools, request_id)
         if tool_calls:
             assistant_message["tool_calls"] = tool_calls
             assistant_message["content"] = ""
 
-    # 8. NORMALIZE: apply_diff with only additions → write_to_file (model tries to create new files)
+    # 8. SCHEMA REMAP: translate canonical priming param names to actual schema names
+    #    (e.g. model outputs <path> but OpenCode's write tool expects filePath)
+    if tool_calls:
+        tool_calls = _remap_args_to_schema(tool_calls, canonical_tools, request_id)
+        assistant_message["tool_calls"] = tool_calls
+
+    # 9. NORMALIZE: apply_diff with only additions → write_to_file (model tries to create new files)
     if tool_calls:
         tool_calls = _convert_new_file_diffs(tool_calls, tool_names, request_id)
         assistant_message["tool_calls"] = tool_calls or None
 
-    # 9. LIMIT: only return the first tool call — model often batches multiple calls but
-    #    Roo Code handles one tool at a time reliably
+    # 10. LIMIT: only return the first tool call — model often batches multiple calls but
+    #     Roo Code handles one tool at a time reliably
     if tool_calls and len(tool_calls) > 1:
         logger.info(
             f"[{request_id}] {len(tool_calls)} tool calls → keeping only first "
@@ -877,26 +1098,51 @@ async def chat_completions(request: Dict[str, Any]) -> Dict[str, Any]:
         tool_calls = tool_calls[:1]
         assistant_message["tool_calls"] = tool_calls
 
+    # 11. DECANONICALIZE: translate canonical tool names back to client-specific names
+    if tool_calls:
+        tool_calls = _decanonicalize_tool_calls(tool_calls, client_type, request_id)
+        assistant_message["tool_calls"] = tool_calls
+
     if not tool_calls:
         logger.info(f"[{request_id}] No tool calls found — returning text response")
 
     finish_reason = "tool_calls" if tool_calls else response["choices"][0].get("finish_reason", "stop")
 
+    # Omit tool_calls key entirely when empty — some clients (e.g. OpenCode) break on null
+    message: Dict[str, Any] = {
+        "role": "assistant",
+        "content": assistant_message.get("content", ""),
+    }
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+
+    response_id = response.get("id", f"chatcmpl-{request_id}")
+    created = response.get("created", 0) or int(time.time())
+    model = request.get("model", settings.upstream_model)
+    usage = response.get("usage", {})
+
+    if stream:
+        logger.info(f"[{request_id}] streaming response (finish_reason={finish_reason})")
+        return StreamingResponse(
+            _stream_response(response_id, created, model, message, finish_reason, usage),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     return {
-        "id": response.get("id", f"chatcmpl-{request_id}"),
+        "id": response_id,
         "object": "chat.completion",
-        "created": response.get("created", 0),
-        "model": request.get("model", settings.upstream_model),
+        "created": created,
+        "model": model,
         "choices": [
             {
                 "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": assistant_message.get("content", ""),
-                    "tool_calls": tool_calls,
-                },
+                "message": message,
                 "finish_reason": finish_reason,
             }
         ],
-        "usage": response.get("usage", {}),
+        "usage": usage,
     }

@@ -1153,6 +1153,106 @@ class TestProseCodeBlockResponse:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# SSE streaming (stream=True)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestStreaming:
+    """When the client sends stream=True, toolproxy must return SSE chunks."""
+
+    def _parse_sse(self, text: str) -> list:
+        """Parse raw SSE text into a list of parsed data dicts."""
+        events = []
+        for line in text.splitlines():
+            if line.startswith("data: ") and line != "data: [DONE]":
+                events.append(json.loads(line[6:]))
+        return events
+
+    def test_stream_tool_call(self, client, llm):
+        """stream=True with XML tool call → SSE chunks with tool_calls delta."""
+        llm.return_value = llm_response(
+            "<read_file><path>README.md</path></read_file>"
+        )
+        resp = client.post("/v1/chat/completions", json={
+            "model": "test-model",
+            "messages": [SYSTEM_MSG, user_msg("Read README.md")],
+            "tools": DEFAULT_TOOLS,
+            "stream": True,
+        })
+        assert resp.status_code == 200
+        assert "text/event-stream" in resp.headers.get("content-type", "")
+
+        events = self._parse_sse(resp.text)
+        assert len(events) >= 3
+
+        # First chunk: role
+        assert events[0]["choices"][0]["delta"].get("role") == "assistant"
+
+        # Find the chunk with tool call name
+        name_chunk = next(
+            (e for e in events if e["choices"][0]["delta"].get("tool_calls")),
+            None,
+        )
+        assert name_chunk is not None
+        tc_delta = name_chunk["choices"][0]["delta"]["tool_calls"][0]
+        assert tc_delta["function"]["name"] == "read_file"
+
+        # Last data chunk: finish_reason == tool_calls
+        finish_chunk = next(
+            (e for e in reversed(events) if e["choices"][0].get("finish_reason")),
+            None,
+        )
+        assert finish_chunk is not None
+        assert finish_chunk["choices"][0]["finish_reason"] == "tool_calls"
+
+        # Response must end with [DONE]
+        assert resp.text.strip().endswith("data: [DONE]")
+
+    def test_stream_text_response(self, client, llm):
+        """stream=True with plain text response → SSE chunks with content delta."""
+        llm.return_value = llm_response("Hello, world!")
+        resp = client.post("/v1/chat/completions", json={
+            "model": "test-model",
+            "messages": [user_msg("Say hi")],
+            "tools": [],
+            "stream": True,
+        })
+        assert resp.status_code == 200
+        assert "text/event-stream" in resp.headers.get("content-type", "")
+
+        events = self._parse_sse(resp.text)
+        content = "".join(
+            e["choices"][0]["delta"].get("content", "")
+            for e in events
+            if e["choices"][0]["delta"].get("content")
+        )
+        assert "Hello" in content
+
+        finish_chunk = next(
+            (e for e in reversed(events) if e["choices"][0].get("finish_reason")),
+            None,
+        )
+        assert finish_chunk["choices"][0]["finish_reason"] == "stop"
+        assert resp.text.strip().endswith("data: [DONE]")
+
+    def test_non_stream_still_works(self, client, llm):
+        """stream=False (or omitted) must still return a regular JSON response."""
+        llm.return_value = llm_response(
+            "<read_file><path>README.md</path></read_file>"
+        )
+        resp = client.post("/v1/chat/completions", json={
+            "model": "test-model",
+            "messages": [SYSTEM_MSG, user_msg("Read README.md")],
+            "tools": DEFAULT_TOOLS,
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["object"] == "chat.completion"
+        name, args = parse_tool_call(data)
+        assert name == "read_file"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # YAML-like tool call format
 # ──────────────────────────────────────────────────────────────────────────────
 

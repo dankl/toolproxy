@@ -4,6 +4,7 @@ XML system prompt builder for toolproxy.
 Converts OpenAI tool definitions → XML examples for the system prompt,
 enabling the OCI model (gpt-oss-120b) to output XML tool calls reliably.
 """
+from enum import Enum
 from typing import Dict, List, Optional
 
 
@@ -23,38 +24,8 @@ def json_schema_to_xml_example(tool_def: Dict) -> str:
     return "\n".join(lines)
 
 
-def build_xml_system_prompt(tools: List[Dict], existing_system: Optional[str] = None) -> str:
-    """
-    Build a system prompt that instructs the model to use XML tool calls.
-
-    The XML format section is placed BEFORE the existing system prompt so the
-    model encounters the format instruction before any long context (file trees,
-    workspace info, etc.) that could dilute it.
-    """
-    tool_names = [t.get("function", {}).get("name", "") for t in tools if t.get("function")]
-    tool_list = ", ".join(f"`{n}`" for n in tool_names if n)
-    tool_examples = "\n\n".join(json_schema_to_xml_example(t) for t in tools)
-
-    xml_section = f"""## TOOL CALLING FORMAT
-
-You have access to these tools: {tool_list}
-
-To call a tool, respond with ONLY the XML — nothing before or after:
-
-<tool_name>
-  <parameter_name>value</parameter_name>
-</tool_name>
-
-Example:
-<read_file>
-  <path>README.md</path>
-</read_file>
-
-## TOOL DEFINITIONS
-
-{tool_examples}
-
-## RULES
+def _build_rules_roo_code() -> str:
+    return """## RULES
 
 1. Your ENTIRE response must be exactly one XML tool call — nothing else
 2. Use ONLY tool names from the list above
@@ -74,9 +45,9 @@ Example:
 ## FORBIDDEN FORMATS
 
 NEVER use any of these formats — they will be ignored:
-- `[assistant to=write_to_file code<|message|>{{...}}` — WRONG
-- `<assistant to=write_to_file code>{{...}}` — WRONG
-- JSON objects like `{{"tool": "name", "parameters": {{...}}}}` — WRONG
+- `[assistant to=write_to_file code<|message|>{...}` — WRONG
+- `<assistant to=write_to_file code>{...}` — WRONG
+- JSON objects like `{"tool": "name", "parameters": {...}}` — WRONG
 - YAML-style like `[write_to_file]\npath: foo\ncontent: |` — WRONG
 - Plain text descriptions of what you would do — WRONG
 - Describing updated file content in a code block — WRONG (see example below)
@@ -141,6 +112,119 @@ CORRECT option 2 — use apply_diff to append a section:
 ====
 
 """
+
+
+def _build_rules_open_code() -> str:
+    return """## RULES
+
+1. Your ENTIRE response must be exactly one XML tool call — nothing else
+2. Use ONLY tool names from the list above
+3. File operations: `read_file` to read | `write_to_file` to create/overwrite | `edit` to modify sections
+4. When modifying an existing file: use `edit` with oldString/newString — do NOT rewrite the entire file with `write_to_file` unless creating it fresh
+5. NEVER output file content as plain text — always call the tool
+6. To run shell commands: use `bash`
+7. To ask a clarifying question: use `question`
+8. When done with ALL steps (every required file written, every command run): respond with a brief plain-text summary (no XML needed)
+   → Only use this AFTER all files have been written with the `write_to_file` tool. Never skip writing a file and describe its content in text instead.
+
+## CRITICAL EXAMPLE — creating a file
+
+WRONG (never do this):
+```
+Hier ist der Inhalt für die Datei witze.md:
+# 5 Witze
+1. ...
+Du kannst diesen Text in witze.md kopieren.
+```
+
+CORRECT (always do this):
+```
+<write_to_file>
+<path>witze.md</path>
+<content># 5 Witze
+1. ...
+</content>
+</write_to_file>
+```
+
+Rule 5 overrides Rule 8: if a file still needs to be written, ALWAYS use the `write_to_file` tool — never describe the content in text.
+
+## FORBIDDEN FORMATS
+
+NEVER use any of these formats — they will be ignored:
+- JSON objects like `{"tool": "name", "parameters": {...}}` — WRONG
+- YAML-style — WRONG
+- Plain text descriptions of what you would do — WRONG
+- Code blocks containing file content — WRONG (use `write` or `edit` tool instead)
+
+====
+
+"""
+
+
+def _build_rules_generic() -> str:
+    return """## RULES
+
+1. Your ENTIRE response must be exactly one XML tool call — nothing else
+2. Use ONLY tool names from the list above
+3. NEVER output content as plain text — always call the tool
+
+====
+
+"""
+
+
+def build_xml_system_prompt(tools: List[Dict], existing_system: Optional[str] = None, client_type=None) -> str:
+    """
+    Build a system prompt that instructs the model to use XML tool calls.
+
+    The XML format section is placed BEFORE the existing system prompt so the
+    model encounters the format instruction before any long context (file trees,
+    workspace info, etc.) that could dilute it.
+    """
+    # Avoid circular import — ClientType is defined in main.py but we receive it as a value
+    from enum import Enum
+
+    class _CT(Enum):
+        ROO_CODE = "roo_code"
+        OPEN_CODE = "open_code"
+        GENERIC = "generic"
+
+    if client_type is None or getattr(client_type, "value", None) == "roo_code":
+        rules = _build_rules_roo_code()
+    elif getattr(client_type, "value", None) == "open_code":
+        rules = _build_rules_open_code()
+    else:
+        rules = _build_rules_generic()
+
+    tool_names = [t.get("function", {}).get("name", "") for t in tools if t.get("function")]
+    tool_list = ", ".join(f"`{n}`" for n in tool_names if n)
+    tool_examples = "\n\n".join(json_schema_to_xml_example(t) for t in tools)
+
+    # Pick a representative read-tool for the example
+    read_tool = next((n for n in tool_names if n in ("read_file", "read")), tool_names[0] if tool_names else "read_file")
+    read_param = "filePath" if read_tool == "read" else "path"
+
+    xml_section = f"""## TOOL CALLING FORMAT
+
+You have access to these tools: {tool_list}
+
+To call a tool, respond with ONLY the XML — nothing before or after:
+
+<tool_name>
+  <parameter_name>value</parameter_name>
+</tool_name>
+
+Example:
+<{read_tool}>
+  <{read_param}>README.md</{read_param}>
+</{read_tool}>
+
+## TOOL DEFINITIONS
+
+{tool_examples}
+
+{rules}"""
 
     if existing_system:
         # XML format instruction goes FIRST so the model sees it before long context
