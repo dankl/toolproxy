@@ -82,7 +82,7 @@ def extract_xml_tool_calls(
             # Remove the XML from remaining content
             remaining_content = remaining_content.replace(xml_content, "", 1)
 
-            logger.info(f"{log_prefix}Extracted XML tool call: {tool_name}")
+            logger.debug(f"{log_prefix}Extracted XML tool call: {tool_name}")
             logger.debug(f"{log_prefix}Arguments: {arguments}")
 
         except Exception as e:

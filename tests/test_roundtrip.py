@@ -292,10 +292,10 @@ class TestPriming:
         assert len(prime_assistants) >= 1
         assert any("<" in (m.get("content") or "") for m in prime_assistants)
 
-    def test_priming_not_injected_on_multi_turn(self, client, llm):
+    def test_priming_injected_on_multi_turn(self, client, llm):
         """
-        Multi-turn conversations (2+ user messages) must NOT get priming —
-        the model already has context.
+        Priming is injected on ALL turns (not just the first) so the model
+        reliably outputs XML even in Turn 2+ without a system prompt.
         """
         captured = []
 
@@ -320,8 +320,8 @@ class TestPriming:
 
         non_system = [m for m in captured if m["role"] != "system"]
         user_messages = [m for m in non_system if m["role"] == "user"]
-        # Only the 2 original user messages — no priming added
-        assert len(user_messages) == 2
+        # Priming adds user messages before the 2 original user messages
+        assert len(user_messages) > 2
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -379,8 +379,10 @@ class TestHistoryNormalisation:
             m for m in captured
             if m.get("role") == "user" and "[Tool Result]" in str(m.get("content", ""))
         ]
-        assert len(tool_result_msgs) == 1
-        assert "File written successfully" in tool_result_msgs[0]["content"]
+        # At least 1 tool result (priming may add additional [Tool Result] messages)
+        assert len(tool_result_msgs) >= 1
+        # The actual tool result must be present (last one is from the real conversation)
+        assert any("File written successfully" in m["content"] for m in tool_result_msgs)
 
         # No raw role:tool messages must reach the LLM
         assert not any(m.get("role") == "tool" for m in captured)
@@ -460,11 +462,12 @@ class TestHistoryNormalisation:
         for m in assistant_msgs:
             assert isinstance(m.get("content"), (str, type(None)))
 
-        # The tool_result should appear as [Tool Result] in a user message
+        # The tool_result must always appear with [Tool Result] prefix — regardless
+        # of whether the client sent role:tool (OpenAI) or content:[tool_result] (Anthropic).
         user_content = " ".join(
             str(m.get("content", "")) for m in captured if m.get("role") == "user"
         )
-        assert "[Tool Result]" in user_content or "def main" in user_content
+        assert "[Tool Result]" in user_content
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -847,6 +850,131 @@ class TestPartialXmlRescue:
         name, args = parse_tool_call(resp.json())
         assert name == "write_to_file"
         assert args["path"] == "Notes.md"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Roo Code built-in tools not always in tools[] (delete_file, rename_file, …)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestRooCodeBuiltinTools:
+    """Built-in Roo tools that may be absent from tools[] but should still be parsed."""
+
+    _TOOLS_WITHOUT_DELETE = [t for t in DEFAULT_TOOLS if t["function"]["name"] != "delete_file"]
+
+    def test_delete_file_not_in_tools_array_still_parsed(self, client, llm):
+        """Model outputs delete_file even though it's not in the request tools[] — must pass through."""
+        llm.return_value = llm_response(
+            "<delete_file><path>test/witze.md</path></delete_file>"
+        )
+        resp = client.post("/v1/chat/completions", json={
+            "model": "test-model",
+            "messages": [SYSTEM_MSG, user_msg("rename folder test to witzeordner")],
+            "tools": self._TOOLS_WITHOUT_DELETE,
+        })
+        assert resp.status_code == 200
+        name, args = parse_tool_call(resp.json())
+        assert name == "delete_file", f"Expected delete_file, got '{name}'"
+        assert args["path"] == "test/witze.md"
+
+    def test_rename_file_not_in_tools_array_still_parsed(self, client, llm):
+        """rename_file is a Roo built-in — should be parsed even when not in tools[]."""
+        llm.return_value = llm_response(
+            "<rename_file><path>old.md</path><newPath>new.md</newPath></rename_file>"
+        )
+        resp = client.post("/v1/chat/completions", json={
+            "model": "test-model",
+            "messages": [SYSTEM_MSG, user_msg("rename old.md to new.md")],
+            "tools": DEFAULT_TOOLS,  # rename_file not in DEFAULT_TOOLS
+        })
+        assert resp.status_code == 200
+        name, args = parse_tool_call(resp.json())
+        assert name == "rename_file"
+        assert args["path"] == "old.md"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Rescue: XML tool calls inside attempt_completion.result
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestAttemptCompletionXmlRescue:
+    """Model placed XML tool calls inside attempt_completion.result instead of
+    outputting them directly — proxy must extract and return the first real call."""
+
+    def test_delete_file_rescued_from_result(self, client, llm):
+        """Single delete_file wrapped in attempt_completion.result → rescued."""
+        llm.return_value = llm_response(
+            "<attempt_completion>"
+            "<result>"
+            "<delete_file><path>ai-guide/README.md</path></delete_file>"
+            "</result>"
+            "</attempt_completion>"
+        )
+        resp = client.post("/v1/chat/completions", json={
+            "model": "test-model",
+            "messages": [SYSTEM_MSG, user_msg("Delete ai-guide/README.md")],
+            "tools": DEFAULT_TOOLS,
+        })
+        assert resp.status_code == 200
+        name, args = parse_tool_call(resp.json())
+        assert name == "delete_file", f"Expected delete_file, got '{name}'"
+        assert args["path"] == "ai-guide/README.md"
+
+    def test_multiple_xml_in_result_returns_first(self, client, llm):
+        """Multiple XML calls in result → only first is returned (LIMIT applies after rescue)."""
+        llm.return_value = llm_response(
+            "<attempt_completion>"
+            "<result>"
+            "<delete_file><path>ai-guide/README.md</path></delete_file>"
+            "<delete_file><path>ai-guide/n8n-workflows/.gitkeep</path></delete_file>"
+            "</result>"
+            "</attempt_completion>"
+        )
+        resp = client.post("/v1/chat/completions", json={
+            "model": "test-model",
+            "messages": [SYSTEM_MSG, user_msg("Clean up ai-guide")],
+            "tools": DEFAULT_TOOLS,
+        })
+        assert resp.status_code == 200
+        name, args = parse_tool_call(resp.json())
+        assert name == "delete_file"
+        assert args["path"] == "ai-guide/README.md"
+
+    def test_plain_text_result_not_rescued(self, client, llm):
+        """Normal attempt_completion with plain text result must pass through unchanged."""
+        llm.return_value = llm_response(
+            "<attempt_completion>"
+            "<result>All files have been written successfully.</result>"
+            "</attempt_completion>"
+        )
+        resp = client.post("/v1/chat/completions", json={
+            "model": "test-model",
+            "messages": [SYSTEM_MSG, user_msg("Are you done?")],
+            "tools": DEFAULT_TOOLS,
+        })
+        assert resp.status_code == 200
+        name, args = parse_tool_call(resp.json())
+        assert name == "attempt_completion"
+        assert "successfully" in args["result"]
+
+    def test_write_to_file_rescued_from_result(self, client, llm):
+        """write_to_file inside attempt_completion.result → rescued."""
+        llm.return_value = llm_response(
+            "<attempt_completion>"
+            "<result>"
+            "<write_to_file><path>output.md</path><content># Done</content></write_to_file>"
+            "</result>"
+            "</attempt_completion>"
+        )
+        resp = client.post("/v1/chat/completions", json={
+            "model": "test-model",
+            "messages": [SYSTEM_MSG, user_msg("Write output.md")],
+            "tools": DEFAULT_TOOLS,
+        })
+        assert resp.status_code == 200
+        name, args = parse_tool_call(resp.json())
+        assert name == "write_to_file"
+        assert args["path"] == "output.md"
+        assert "Done" in args["content"]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1250,6 +1378,295 @@ class TestStreaming:
         assert data["object"] == "chat.completion"
         name, args = parse_tool_call(data)
         assert name == "read_file"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers for Anthropic-format messages (Roo Code sends this format)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _roo_tool_result_msg(tool_use_id: str, content: str) -> dict:
+    """
+    Build the role:user message that Roo Code sends after tool execution.
+
+    Roo Code uses the Anthropic API format internally: tool results arrive as
+    content:[{type:"tool_result"}] inside a role:user message, NOT as role:tool.
+    """
+    return {
+        "role": "user",
+        "content": [
+            {"type": "tool_result", "tool_use_id": tool_use_id, "content": content},
+        ],
+    }
+
+
+def _roo_assistant_tool_use_msg(tool_use_id: str, name: str, input_: dict) -> dict:
+    """Build the role:assistant message with a tool_use block (Anthropic format)."""
+    return {
+        "role": "assistant",
+        "content": [
+            {"type": "tool_use", "id": tool_use_id, "name": name, "input": input_},
+        ],
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Emergency fallback: empty upstream response
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestEmptyModelResponseFallback:
+    """
+    When the upstream LLM returns empty content (e.g. OCI silently returns null),
+    toolproxy must synthesize an attempt_completion rather than returning an empty
+    assistant message that clients like Roo Code reject as "no assistant messages".
+    """
+
+    def test_empty_content_synthesizes_attempt_completion(self, client, llm):
+        """Empty upstream response → attempt_completion fallback."""
+        llm.return_value = llm_response("")  # upstream returns empty string
+
+        resp = client.post("/v1/chat/completions", json={
+            "model": "test-model",
+            "messages": [SYSTEM_MSG, user_msg("Do something.")],
+            "tools": DEFAULT_TOOLS,
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        name, args = parse_tool_call(data)
+        assert name == "attempt_completion"
+        assert "result" in args
+
+    def test_empty_content_finish_reason_is_tool_calls(self, client, llm):
+        """finish_reason must be tool_calls when fallback fires."""
+        llm.return_value = llm_response("")
+
+        resp = client.post("/v1/chat/completions", json={
+            "model": "test-model",
+            "messages": [SYSTEM_MSG, user_msg("Do something.")],
+            "tools": DEFAULT_TOOLS,
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["choices"][0]["finish_reason"] == "tool_calls"
+
+    def test_empty_content_no_attempt_completion_tool_returns_text(self, client, llm):
+        """If attempt_completion is not in the tools list, return empty text (no crash)."""
+        tools_without_completion = [t for t in DEFAULT_TOOLS if t["function"]["name"] != "attempt_completion"]
+        llm.return_value = llm_response("")
+
+        resp = client.post("/v1/chat/completions", json={
+            "model": "test-model",
+            "messages": [SYSTEM_MSG, user_msg("Do something.")],
+            "tools": tools_without_completion,
+        })
+        assert resp.status_code == 200
+        # No crash — just returns whatever (empty text response is acceptable here)
+        data = resp.json()
+        assert "choices" in data
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Loop detection with Roo Code Anthropic format
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestLoopDetectionRooCodeFormat:
+    """
+    Loop detection must work when Roo Code sends tool results in Anthropic format
+    (role:user + content:[{type:"tool_result"}]) instead of OpenAI role:tool.
+
+    Before the fix: the normalizer did not add [Tool Result] prefix to Anthropic
+    tool_result blocks, so loop_detection treated every tool result as a genuine
+    user instruction and always reset the counter → detection never fired.
+    """
+
+    def test_loop_detected_with_anthropic_format_tool_results(self, client, llm):
+        """
+        Two consecutive Roo Code-format tool results containing 'created' must
+        trigger the loop stop-hint, just like role:tool results do.
+        """
+        captured = []
+
+        async def side_effect(messages=None, **kwargs):
+            captured.extend(messages or [])
+            return llm_response(
+                "<attempt_completion><result>Done.</result></attempt_completion>"
+            )
+
+        llm.side_effect = side_effect
+
+        messages = [
+            SYSTEM_MSG,
+            user_msg("Create two files."),
+            _roo_assistant_tool_use_msg("tu_1", "write_to_file",
+                                        {"path": "a.py", "content": "x"}),
+            _roo_tool_result_msg("tu_1", '{"path":"a.py","operation":"created"}'),
+            _roo_assistant_tool_use_msg("tu_2", "write_to_file",
+                                        {"path": "b.py", "content": "y"}),
+            _roo_tool_result_msg("tu_2", '{"path":"b.py","operation":"created"}'),
+        ]
+
+        resp = client.post("/v1/chat/completions", json={
+            "model": "test-model",
+            "messages": messages,
+            "tools": DEFAULT_TOOLS,
+        })
+        assert resp.status_code == 200
+
+        last_user = next(
+            (m for m in reversed(captured) if m.get("role") == "user"), None
+        )
+        assert last_user is not None
+        content = last_user["content"]
+        assert "[CORRECTION]" in content or "STOP" in content
+
+    def test_loop_resets_on_user_message_in_attempt_completion_result(self, client, llm):
+        """
+        Reproduces the exact bug from the diagnostics:
+          1. write_to_file(test/Witze.md) → created
+          2. attempt_completion → user replies 'rename test to witzeordner'
+          3. write_to_file(witzeordner/Witze.md) → created
+
+        After step 3 the model needs to respond (attempt_completion).
+        Loop detection must NOT fire (false positive) because the two writes
+        belong to two different user instructions separated by a new task boundary.
+        """
+        captured = []
+
+        async def side_effect(messages=None, **kwargs):
+            captured.extend(messages or [])
+            return llm_response(
+                "<attempt_completion><result>Renamed.</result></attempt_completion>"
+            )
+
+        llm.side_effect = side_effect
+
+        messages = [
+            SYSTEM_MSG,
+            # First instruction: create test/Witze.md
+            user_msg("Create test/Witze.md."),
+            _roo_assistant_tool_use_msg("tu_1", "write_to_file",
+                                        {"path": "test/Witze.md", "content": "# Jokes"}),
+            _roo_tool_result_msg("tu_1", '{"path":"test/Witze.md","operation":"created"}'),
+            _roo_assistant_tool_use_msg("tu_ac", "attempt_completion",
+                                        {"result": "Done."}),
+            # attempt_completion result contains the new user instruction
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tu_ac",
+                        "content": [{"type": "text",
+                                     "text": "<user_message>Rename test to witzeordner</user_message>"}],
+                    },
+                ],
+            },
+            # Second instruction: write to new location
+            _roo_assistant_tool_use_msg("tu_2", "write_to_file",
+                                        {"path": "witzeordner/Witze.md", "content": "# Jokes"}),
+            _roo_tool_result_msg("tu_2", '{"path":"witzeordner/Witze.md","operation":"created"}'),
+        ]
+
+        resp = client.post("/v1/chat/completions", json={
+            "model": "test-model",
+            "messages": messages,
+            "tools": DEFAULT_TOOLS,
+        })
+        assert resp.status_code == 200
+
+        last_user = next(
+            (m for m in reversed(captured) if m.get("role") == "user"), None
+        )
+        assert last_user is not None
+        content = last_user["content"]
+        # Stop hint must NOT fire — these are two legitimate writes for two instructions
+        assert "[CORRECTION]" not in content
+        assert "STOP" not in content
+
+    def test_anthropic_tool_result_gets_tool_result_prefix(self, client, llm):
+        """
+        After normalization, Anthropic-format tool_result blocks must carry the
+        [Tool Result] prefix in the upstream messages, identical to role:tool messages.
+        """
+        captured = []
+
+        async def side_effect(messages=None, **kwargs):
+            captured.extend(messages or [])
+            return llm_response(
+                "<attempt_completion><result>Done.</result></attempt_completion>"
+            )
+
+        llm.side_effect = side_effect
+
+        messages = [
+            SYSTEM_MSG,
+            user_msg("Do something."),
+            _roo_assistant_tool_use_msg("tu_1", "read_file", {"path": "app.py"}),
+            _roo_tool_result_msg("tu_1", "def main(): pass"),
+        ]
+
+        client.post("/v1/chat/completions", json={
+            "model": "test-model",
+            "messages": messages,
+            "tools": DEFAULT_TOOLS,
+        })
+
+        user_msgs = [m for m in captured if m.get("role") == "user"]
+        # Find the normalized tool result message
+        tool_result_content = " ".join(str(m.get("content", "")) for m in user_msgs)
+        assert "[Tool Result]" in tool_result_content
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# rename hallucination → move_file
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestRenameHallucination:
+    """Model outputs <rename> — must be resolved to move_file with correct params."""
+
+    def test_rename_xml_resolved_to_move_file(self, client, llm):
+        """<rename><old_path>...</old_path><new_path>...</new_path></rename> → move_file(source, destination)"""
+        llm.return_value = llm_response(
+            "<rename><old_path>test</old_path><new_path>witzeordner</new_path></rename>"
+        )
+        resp = client.post("/v1/chat/completions", json={
+            "model": "test-model",
+            "messages": [SYSTEM_MSG, user_msg("Rename test to witzeordner")],
+            "tools": DEFAULT_TOOLS,
+        })
+        assert resp.status_code == 200
+        name, args = parse_tool_call(resp.json())
+        assert name == "move_file"
+        assert args["source"] == "test"
+        assert args["destination"] == "witzeordner"
+
+    def test_rename_without_old_new_path_passthrough(self, client, llm):
+        """If model already uses correct param names they pass through unchanged."""
+        llm.return_value = llm_response(
+            "<move_file><source>foo</source><destination>bar</destination></move_file>"
+        )
+        resp = client.post("/v1/chat/completions", json={
+            "model": "test-model",
+            "messages": [SYSTEM_MSG, user_msg("Move foo to bar")],
+            "tools": DEFAULT_TOOLS,
+        })
+        assert resp.status_code == 200
+        name, args = parse_tool_call(resp.json())
+        assert name == "move_file"
+        assert args == {"source": "foo", "destination": "bar"}
+
+    def test_rename_finish_reason_tool_calls(self, client, llm):
+        """finish_reason must be tool_calls when rename is resolved."""
+        llm.return_value = llm_response(
+            "<rename><old_path>a</old_path><new_path>b</new_path></rename>"
+        )
+        resp = client.post("/v1/chat/completions", json={
+            "model": "test-model",
+            "messages": [SYSTEM_MSG, user_msg("Rename a to b")],
+            "tools": DEFAULT_TOOLS,
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["choices"][0]["finish_reason"] == "tool_calls"
 
 
 # ──────────────────────────────────────────────────────────────────────────────

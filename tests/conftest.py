@@ -59,6 +59,11 @@ TOOL_ATTEMPT_COMPLETION = _tool(
     {"result": {"type": "string"}},
     ["result"],
 )
+TOOL_DELETE_FILE = _tool(
+    "delete_file", "Delete a file",
+    {"path": {"type": "string"}},
+    ["path"],
+)
 
 DEFAULT_TOOLS = [
     TOOL_WRITE_TO_FILE,
@@ -67,6 +72,7 @@ DEFAULT_TOOLS = [
     TOOL_APPLY_DIFF,
     TOOL_LIST_FILES,
     TOOL_ATTEMPT_COMPLETION,
+    TOOL_DELETE_FILE,
 ]
 
 # Common message helpers

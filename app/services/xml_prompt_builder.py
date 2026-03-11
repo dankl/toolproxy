@@ -28,19 +28,71 @@ def _build_rules_roo_code() -> str:
     return """## RULES
 
 1. Your ENTIRE response must be exactly one XML tool call — nothing else
-2. Use ONLY tool names from the list above
-3. Name corrections: `write_file` → `write_to_file` | `open_file` → `read_file` | `apply_patch` → `apply_diff`
-4. To CREATE a new file: use `write_to_file` with the COMPLETE file content.
+2. Use ONLY tool names from the list above — NEVER invent tool names
+3. To CREATE a new file: use `write_to_file` with the COMPLETE file content.
    To MODIFY an existing file:
    - First call `read_file` to get the current content
    - Then use `apply_diff` to change specific sections, OR `write_to_file` with the COMPLETE updated content
    - NEVER use `write_to_file` with only the new/changed portion — this destroys existing content
-5. NEVER output file content as plain text — always call the tool
-6. When the task is complete, call `attempt_completion`
-   → A task is ONLY complete when ALL required files exist on disk.
-     Write every file with write_to_file first, THEN call attempt_completion.
-     Do NOT describe files in text — write them with the tool.
-7. In `attempt_completion`, the `result` field must contain ONLY a short plain-text summary — NO code, NO XML, NO file contents
+4. NEVER output file content as plain text — always call the tool
+5. When the task is complete, call `attempt_completion`
+   → A task is ONLY complete when ALL required files exist on disk and all required actions are done.
+   → `result` must be a SHORT plain-text summary (1-2 sentences) of what was done — NOTHING ELSE.
+   → NEVER put questions, options, XML, code, or file contents inside `result`.
+   → Do NOT ask the user to choose — just complete the task using the most straightforward approach.
+6. Name corrections: `write_file` → `write_to_file` | `open_file` → `read_file` | `apply_patch` → `apply_diff`
+
+## CRITICAL RULE — renaming or moving files and folders
+
+To rename or move any file or folder: use `move_file` with `<source>` and `<destination>`.
+- NEVER use `rename`, `move`, or any other name — ALWAYS `move_file`
+- NEVER call `read_file` before `move_file` — `move_file` works on paths, not content
+- NEVER do copy+delete (write_to_file the content, then delete_file the original) — use `move_file`
+
+WRONG (never do this):
+[read_file test/Witze.md]    ← unnecessary
+[write_to_file witzeordner/Witze.md ...]    ← manual copy
+[delete_file test/Witze.md]    ← manual delete
+[delete_folder test]    ← manual delete
+
+CORRECT:
+```
+<move_file>
+<source>test</source>
+<destination>witzeordner</destination>
+</move_file>
+```
+
+## CRITICAL EXAMPLE — attempt_completion with pending actions
+
+WRONG (never do this — XML inside result is displayed as text, NOT executed):
+```
+<attempt_completion>
+<result>
+<delete_file><path>ai-guide/README.md</path></delete_file>
+<delete_folder><path>ai-guide</path></delete_folder>
+</result>
+</attempt_completion>
+```
+
+CORRECT — perform each action first, then summarize in plain text:
+```
+<delete_file>
+<path>ai-guide/README.md</path>
+</delete_file>
+```
+[after file is deleted, next turn:]
+```
+<delete_folder>
+<path>ai-guide</path>
+</delete_folder>
+```
+[after folder is deleted, next turn:]
+```
+<attempt_completion>
+<result>Deleted ai-guide/README.md and the ai-guide folder.</result>
+</attempt_completion>
+```
 
 ## FORBIDDEN FORMATS
 

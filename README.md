@@ -7,9 +7,8 @@ Tool-Call-Proxy für OpenAI-kompatible Sprachmodelle ohne nativen Function-Call-
 | Modell | Anmerkung |
 |---|---|
 | `gpt-oss-120b` | Primäres Entwicklungsmodell; Chat-Template-Leak-Verhalten bekannt und abgefangen |
-| `gpt-oss-20b` | Frühere Version; Grundlage für initiales XML-Priming-Konzept |
 
-Das XML-Format und alle Fallbacks wurden auf Basis dieser Modelle entwickelt. Andere Modelle ohne native Function-Call-Unterstützung sollten funktionieren, können aber andere Eigenheiten zeigen.
+Das XML-Format und alle Fallbacks wurden auf Basis dieses Modells entwickelt. Andere Modelle ohne native Function-Call-Unterstützung sollten funktionieren, können aber andere Eigenheiten zeigen.
 
 ## Warum?
 
@@ -48,6 +47,7 @@ Das Modell spricht immer **kanonische Tool-Namen** (ROO-Code-Stil). Client-spezi
 |---|---|---|---|
 | `read` | `read_file` | `read_file` | ✅ übersetzt |
 | `write` | `write_to_file` | `write_to_file` | ✅ übersetzt |
+| `list` | `list_files` | `list_files` | ✅ übersetzt |
 | `edit` | `edit` | *(kein Äquivalent)* | — passthrough |
 | `bash` | `bash` | *(kein Äquivalent)* | — passthrough |
 | `glob` | `glob` | *(kein Äquivalent)* | — passthrough |
@@ -55,24 +55,24 @@ Das Modell spricht immer **kanonische Tool-Namen** (ROO-Code-Stil). Client-spezi
 | `question` | `question` | *(kein Äquivalent)* | — passthrough |
 | `task` | `task` | *(kein Äquivalent)* | — passthrough |
 | `webfetch` | `webfetch` | *(kein Äquivalent)* | — passthrough |
+| `websearch` | `websearch` | *(kein Äquivalent)* | — passthrough |
+| `codesearch` | `codesearch` | *(kein Äquivalent)* | — passthrough |
 | `todowrite` | `todowrite` | *(kein Äquivalent)* | — passthrough |
 | `skill` | `skill` | *(kein Äquivalent)* | — passthrough |
 | *(kein Äquivalent)* | `apply_diff` | `apply_diff` | — nur Roo |
 | *(kein Äquivalent)* | `attempt_completion` | `attempt_completion` | — nur Roo |
-| *(kein Äquivalent)* | `list_files` | `list_files` | — nur Roo |
 | *(kein Äquivalent)* | `execute_command` | `execute_command` | — nur Roo |
 
 **Parameter-Mapping** (zusätzlich, via Schema-Remap):
 
 | LLM-Output (kanonisch) | OpenCode-Schema | Roo-Schema |
 |---|---|---|
-| `<path>` in `write_to_file` | → `filePath` | → `path` |
-| `<path>` in `read_file` | → `filePath` | → `path` |
+| `<path>` in `write_to_file` | → `file_path` oder `filePath` (erste Übereinstimmung) | → `path` |
 
 Im Log sichtbar als:
 ```
 INFO  [abc12345] Decanonicalize: 'write_to_file' → 'write'
-INFO  [abc12345] Schema remap write_to_file: 'path' → 'filePath'
+INFO  [abc12345] Schema remap write_to_file: 'path' → 'file_path'
 ```
 
 ## Kernmechanismen
@@ -135,14 +135,21 @@ Das Modell halluziniert gelegentlich Tool-Namen. Bekannte Mappings:
 
 | Modell-Output | Echter Tool-Name |
 |---|---|
-| `write_file` | `write_to_file` |
-| `create_file` | `write_to_file` |
-| `open_file` | `read_file` |
-| `view_file` | `read_file` |
-| `read_file_content` | `read_file` |
-| `apply_patch` | `apply_diff` |
-| `patch_file` | `apply_diff` |
-| `list_dir` / `ls` / `list_directory` | `list_files` |
+| `write_file`, `create_file` | `write_to_file` |
+| `open_file`, `view_file`, `read_file_content` | `read_file` |
+| `apply_patch`, `patch_file`, `patch` | `apply_diff` |
+| `list_dir`, `ls`, `list_directory` | `list_files` |
+| `search`, `find`, `search_code` | `search_files` |
+| `search_codebase`, `semantic_search` | `codebase_search` |
+| `search_and_replace`, `search_replace`, `replace_in_file`, `find_replace` | `edit` |
+| `rename`, `move` | `move_file` → via Fixup zu `execute_command(mv)` |
+| `bash`, `run_command`, `execute`, `run`, `shell` | `execute_command` |
+| `ask_followup`, `ask_question`, `ask_user`, `followup_question` | `ask_followup_question` |
+| `create_task`, `task`, `subtask` | `new_task` |
+| `read_output`, `get_output`, `command_output` | `read_command_output` |
+| `use_skill`, `run_skill` | `skill` |
+| `change_mode`, `set_mode`, `mode` | `switch_mode` |
+| `update_todos`, `update_todo`, `todo`, `set_todos` | `update_todo_list` |
 
 ## Integration
 
@@ -219,9 +226,22 @@ python3 -m pytest -v
 python3 -m pytest -v tests/test_roundtrip.py::TestXmlToolCalls
 ```
 
-Aktuelle Test-Coverage: ~52 Tests in `test_roundtrip.py` und `test_xml_parser.py`.
+Aktuelle Test-Coverage: 65 Tests in `test_roundtrip.py` und `test_xml_parser.py`.
 
 ## Bekannte Modell-Eigenheiten & Proxy-Fixes
+
+### move_file / rename_file → execute_command(mv) (implementiert)
+
+`move_file` und `rename_file` sind Roo Code Builtins, die **nicht** im `tools[]`-Array erscheinen das Roo Code an die API schickt. Roo Code 3.51.1 dropped tool_calls für unbekannte Tools lautlos — kein Approval-Dialog, kein Fehler, nur "no assistant messages" nach Timeout.
+
+Der Proxy fängt das in Step 5b ab: `move_file(source=X, destination=Y)` → `execute_command(command="mv 'X' 'Y'")`. `execute_command` ist immer in `tools[]` → Roo Code zeigt den normalen Approval-Dialog. Funktioniert für Dateien und Ordner gleichermaßen.
+
+Das Priming lehrt das Modell direkt `execute_command` für Rename-Aufgaben zu nutzen; der Fallback greift wenn das Modell trotzdem `move_file` ausgibt.
+
+Im Log sichtbar als:
+```
+INFO  [abc12345] Convert move_file → execute_command: "mv 'old_folder' 'new_folder'"
+```
 
 ### apply_diff für neue Dateien → write_to_file (implementiert)
 Das Modell verwendet `apply_diff` mit ausschließlich `+`-Zeilen um neue Dateien zu erstellen — Roo Code kann das nicht verarbeiten. Der Proxy erkennt "all-additions diffs" automatisch und konvertiert sie zu `write_to_file`.
@@ -316,18 +336,31 @@ WARNING [abc12345] SUCCESS LOOP: 2 consecutive successful write operations — i
 
 ## Logs verstehen
 
+Ein normaler Request erzeugt genau 3 INFO-Zeilen:
 ```
-INFO  [abc12345] model=your-model-name messages=3 tools=12 client=open_code
-INFO  [abc12345] XML parsed 1 tool call(s)                               ← Normalfall
+INFO  [abc12345] model=your-model-name messages=3 tools=12 client=roo_code
+INFO  [abc12345] model output (542 chars): <write_to_file>\n<path>foo.py</path>...
+INFO  [abc12345] XML parsed 1 tool call(s): write_to_file
+```
+
+Anomalien und Fixes erscheinen als zusätzliche Zeilen:
+```
 INFO  [abc12345] XML alias: 'write_file' → 'write_to_file'               ← Tool-Name-Aliasing
 INFO  [abc12345] Partial XML rescue → write_to_file('Plan.md')           ← Abgeschnittener Response
 INFO  [abc12345] JSON fallback: [Tool Call:] → read_file                 ← JSON-Fallback
+INFO  [abc12345] Convert move_file → execute_command: "mv 'src' 'dst'"    ← Rename/Move-Fix
 INFO  [abc12345] apply_diff all-additions on 'Main.java' → write_to_file ← Diff-Konvertierung
 INFO  [abc12345] 3 tool calls → keeping only first ('write_to_file')     ← Multi-Call Limit
 INFO  [abc12345] Text response looks like file content → synthesizing write_to_file(...)  ← Text-Synthesis
 INFO  [abc12345] Text response → synthesizing attempt_completion fallback ← Synthesis-Fallback
 INFO  [abc12345] Schema remap write_to_file: 'path' → 'filePath'         ← Parameter-Remap (OpenCode)
-INFO  [abc12345] Decanonicalize: 'write_to_file' → 'write'               ← Tool-Name zurückübersetzen
 INFO  [abc12345] No tool calls found — returning text response           ← Reine Textantwort
 WARNING [abc12345] SUCCESS LOOP: 2 consecutive successful write operations — injecting stop hint
+```
+
+Nur bei `LOG_LEVEL=DEBUG` zusätzlich sichtbar:
+```
+DEBUG [abc12345] Extracted XML tool call: write_to_file
+DEBUG [abc12345] Decanonicalize: 'write_to_file' → 'write'
+DEBUG vllm_client — Payload: {...}
 ```
