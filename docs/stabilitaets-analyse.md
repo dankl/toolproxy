@@ -180,7 +180,7 @@ den Test-Teardown.
 
 ## Lücken in der Testabdeckung
 
-Die bestehende Testsuite (65+ Tests) ist für den Happy Path solide. Bemerkenswerte Lücken:
+Die bestehende Testsuite (74 Tests) ist für den Happy Path solide. Bemerkenswerte Lücken:
 
 - **Streaming-Pfad** (`stream: true`) — null Tests
 - **Loop-Erkennung** schlägt auf Fehlermeldungen an, die Erfolgswörter enthalten
