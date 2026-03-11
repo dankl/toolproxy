@@ -1,10 +1,13 @@
 """
 Shared fixtures and tool definitions for live integration tests.
 
-Requires oci-proxy accessible on localhost:8005 (e.g. via SSH tunnel):
-    ssh -L 8005:localhost:8005 remote-host
+Verbindungseinstellungen via Env-Variablen (kein SSH-Tunnel nötig):
 
-Run:
+    export LITELLM_MASTER_KEY="dein-key"
+    export LIVE_UPSTREAM_URL="http://10.3.0.120:4000/v1"   # optional, das ist der Default
+    export LIVE_MODEL="openai/gpt-oss-120b"                 # optional, das ist der Default
+
+Ausführen:
     cd toolproxy && python3 -m pytest -m live -v
 """
 import asyncio
