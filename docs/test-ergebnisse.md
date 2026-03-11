@@ -1,7 +1,7 @@
 # Testergebnisse & Zusammenfassung
 
 Datum: 2026-03-11
-Modell: `gpt-oss-120b` via LiteLLM (`http://10.3.0.120:4000/v1`)
+Modell: `gpt-oss-120b` via LiteLLM
 
 ---
 
@@ -22,11 +22,11 @@ pip install -r requirements.txt -r requirements-test.txt
 
 ### `.env` für lokalen Proxy-Start (optional)
 
-```
-UPSTREAM_URL=http://10.3.0.120:4000/v1
-UPSTREAM_MODEL=openai/gpt-oss-120b
-UPSTREAM_API_KEY=<LITELLM_MASTER_KEY>
-LOG_LEVEL=DEBUG
+Vorlage: [`.env.example`](../.env.example) im Root kopieren und befüllen:
+
+```bash
+cp .env.example .env
+# UPSTREAM_URL, UPSTREAM_API_KEY eintragen
 ```
 
 ### Tests ausführen
@@ -50,11 +50,11 @@ python3 -m pytest -m live -v tests/live/test_findings.py
 `tests/live/conftest.py` war ursprünglich auf `localhost:8005` hardcodiert (SSH-Tunnel nötig).
 Wurde auf Env-Variablen umgestellt — funktioniert jetzt ohne Tunnel direkt gegen LiteLLM:
 
-| Env-Variable | Default | Beschreibung |
+| Env-Variable | Pflicht? | Beschreibung |
 |---|---|---|
-| `LIVE_UPSTREAM_URL` | `http://10.3.0.120:4000/v1` | LiteLLM-Endpoint |
-| `LIVE_MODEL` | `openai/gpt-oss-120b` | Modell-Name |
-| `LIVE_API_KEY` | `$LITELLM_MASTER_KEY` | API-Key |
+| `LIVE_UPSTREAM_URL` | **Ja** | LiteLLM-Endpoint (`http://<host>:4000/v1`) |
+| `LIVE_MODEL` | Nein | Modell-Name (Default: `openai/gpt-oss-120b`) |
+| `LIVE_API_KEY` | Nein | API-Key (fallback: `$LITELLM_MASTER_KEY`) |
 
 ---
 

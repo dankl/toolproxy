@@ -4,8 +4,8 @@ Shared fixtures and tool definitions for live integration tests.
 Verbindungseinstellungen via Env-Variablen (kein SSH-Tunnel nötig):
 
     export LITELLM_MASTER_KEY="dein-key"
-    export LIVE_UPSTREAM_URL="http://10.3.0.120:4000/v1"   # optional, das ist der Default
-    export LIVE_MODEL="openai/gpt-oss-120b"                 # optional, das ist der Default
+    export LIVE_UPSTREAM_URL="http://<LITELLM_HOST>:4000/v1"    # Pflicht: LiteLLM-Endpoint
+    export LIVE_MODEL="openai/gpt-oss-120b"                     # optional, das ist der Default
 
 Ausführen:
     cd toolproxy && python3 -m pytest -m live -v
@@ -165,11 +165,13 @@ def live(client):
     Reads connection settings from environment variables so the same tests
     work on any setup without editing this file:
 
-        LIVE_UPSTREAM_URL   — default: http://10.3.0.120:4000/v1
+        LIVE_UPSTREAM_URL   — Pflicht: LiteLLM-Endpoint (kein Default)
         LIVE_MODEL          — default: openai/gpt-oss-120b
         LIVE_API_KEY        — default: $LITELLM_MASTER_KEY (then "dummy-key")
     """
-    base_url = os.environ.get("LIVE_UPSTREAM_URL", "http://10.3.0.120:4000/v1")
+    base_url = os.environ.get("LIVE_UPSTREAM_URL")
+    if not base_url:
+        pytest.skip("LIVE_UPSTREAM_URL nicht gesetzt — Live-Test übersprungen")
     model = os.environ.get("LIVE_MODEL", "openai/gpt-oss-120b")
     api_key = os.environ.get("LIVE_API_KEY") or os.environ.get("LITELLM_MASTER_KEY", "dummy-key")
 
