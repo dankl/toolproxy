@@ -132,43 +132,7 @@ Keys present: ['role', 'content', 'tool_calls']
 ## Vorgeschlagene Fixes
 
 Alle Priorität-1-Fixes sind voneinander unabhängig und können parallel umgesetzt werden.
-Vollständiger Fix-Plan: [fix-plan.md](fix-plan.md)
-
-### Bug 1 — Loop Detection (`loop_detection.py:60`, 3 Zeilen)
-
-```python
-_ERROR_INDICATORS = ("error", "failed", "could not", "unable to", "exception", "traceback")
-has_success = any(word in lower for word in _WRITE_SUCCESS_WORDS)
-has_error   = any(word in lower for word in _ERROR_INDICATORS)
-if has_success and not has_error:
-    success_count += 1
-```
-
-### Bug 4 — Shell Injection (`tool_call_fixups.py:288`, 2 Zeilen)
-
-```python
-import shlex
-cmd = f"mv {shlex.quote(source)} {shlex.quote(dest)}"
-```
-
-### Bug 7 — `tool_calls`-Schlüssel (`message_normalizer.py:112`, 1 Zeile)
-
-```python
-msg["content"] = "\n".join(xml_parts)
-msg.pop("tool_calls", None)   # ← hinzufügen
-```
-
-### Bug 2 — Text-Synthese-Heuristik (`text_synthesis.py:103`)
-
-```python
-_CODE_MARKERS = ("```", "def ", "class ", "import ", "function ", "const ", "export ")
-looks_like_file_content = (
-    not looks_like_xml_tool_call
-    and len(stripped) > 200
-    and any(marker in stripped for marker in _CODE_MARKERS)
-    and not stripped.lower().startswith(("i ", "the ", "here ", "this ", "let me", "to "))
-)
-```
+Konkrete Code-Snippets und vollständiger Fix-Plan: [fix-plan.md](fix-plan.md)
 
 ---
 
