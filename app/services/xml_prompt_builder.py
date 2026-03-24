@@ -41,6 +41,9 @@ def _build_rules_roo_code() -> str:
    → NEVER put questions, options, XML, code, or file contents inside `result`.
    → Do NOT ask the user to choose — just complete the task using the most straightforward approach.
 6. Name corrections: `write_file` → `write_to_file` | `open_file` → `read_file` | `apply_patch` → `apply_diff`
+7. NEVER write markdown, README, or documentation content into config files
+   (application.yml, application.yaml, pom.xml, build.gradle, *.properties, *.xml build files).
+   Always create a dedicated .md file (e.g. README.md, docs/setup.md) for documentation.
 
 ## CRITICAL RULE — renaming or moving files and folders
 
@@ -166,6 +169,58 @@ CORRECT option 2 — use apply_diff to append a section:
 """
 
 
+def _build_rules_cline() -> str:
+    return """## RULES
+
+1. Your ENTIRE response must be exactly one XML tool call — nothing else
+2. Use ONLY tool names from the list above — NEVER invent tool names
+3. To CREATE a new file: use `write_to_file` with the COMPLETE file content.
+   To MODIFY an existing file:
+   - First call `read_file` to get the current content
+   - Then use `replace_in_file` to change specific sections, OR `write_to_file` with the COMPLETE updated content
+   - NEVER use `write_to_file` with only the new/changed portion — this destroys existing content
+4. NEVER output file content as plain text — always call the tool
+5. When the task is complete, call `attempt_completion`
+   → `result` must be a SHORT plain-text summary (1-2 sentences) — NOTHING ELSE.
+   → NEVER put questions, XML, or code inside `result`.
+6. NEVER write markdown or documentation content into config files
+
+## replace_in_file FORMAT
+
+Use `replace_in_file` with one or more SEARCH/REPLACE blocks inside `<diff>`:
+
+```
+<replace_in_file>
+<path>src/foo.py</path>
+<diff>
+<<<<<<< SEARCH
+old code to find (must match exactly, including whitespace)
+=======
+new code to replace it with
+>>>>>>> REPLACE
+</diff>
+</replace_in_file>
+```
+
+Rules for SEARCH/REPLACE blocks:
+- SEARCH content must match the existing file content exactly (including indentation and line endings)
+- Each block replaces the FIRST matching occurrence
+- Multiple blocks are allowed in one `<diff>` — they are applied top to bottom
+- SEARCH must not be empty (use `write_to_file` to create new files instead)
+
+## FORBIDDEN FORMATS
+
+NEVER use any of these formats — they will be ignored:
+- JSON objects like `{"tool": "name", "parameters": {...}}` — WRONG
+- YAML-style — WRONG
+- Plain text descriptions of what you would do — WRONG
+- Describing updated file content in a code block — WRONG
+
+====
+
+"""
+
+
 def _build_rules_open_code() -> str:
     return """## RULES
 
@@ -242,10 +297,12 @@ def build_xml_system_prompt(tools: List[Dict], existing_system: Optional[str] = 
         OPEN_CODE = "open_code"
         GENERIC = "generic"
 
-    if client_type is None or getattr(client_type, "value", None) == "roo_code":
-        rules = _build_rules_roo_code()
-    elif getattr(client_type, "value", None) == "open_code":
+    if getattr(client_type, "value", None) == "open_code":
         rules = _build_rules_open_code()
+    elif getattr(client_type, "value", None) == "cline":
+        rules = _build_rules_cline()
+    elif client_type is None or getattr(client_type, "value", None) == "roo_code":
+        rules = _build_rules_roo_code()
     else:
         rules = _build_rules_generic()
 

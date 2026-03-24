@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 _PRIMING_PREFERRED: Dict[str, List[str]] = {
     ClientType.ROO_CODE.value: ["read_file", "write_to_file", "attempt_completion"],
     ClientType.OPEN_CODE.value: ["read_file", "write_to_file", "bash"],
+    ClientType.CLINE.value: ["read_file", "write_to_file", "replace_in_file"],
     ClientType.GENERIC.value: [],
 }
 
@@ -27,6 +28,11 @@ _PRIMING_QUESTIONS: Dict[str, List[str]] = {
         "Read the file README.md and show me what's in it.",
         "Create a new file called hello.py.",
         "Run the tests.",
+    ],
+    ClientType.CLINE.value: [
+        "Read the file README.md and show me what's in it.",
+        "Create a new file called hello.py with a Hello World function.",
+        "Fix the typo 'recieve' in src/utils.py.",
     ],
 }
 
@@ -71,6 +77,20 @@ _STATIC_PRIMING_SEQUENCES: Dict[str, List[List[Dict]]] = {
             {"role": "assistant", "content": "<read_file>\n<path>notes.md</path>\n</read_file>"},
             {"role": "user", "content": "[Tool Result]\n1. Buy milk\n2. Buy eggs"},
             {"role": "assistant", "content": "<write_to_file>\n<path>notes.md</path>\n<content>1. Buy milk\n2. Buy eggs\n3. Call dentist\n4. Water plants\n5. Fix bike</content>\n</write_to_file>"},
+        ],
+    ],
+    ClientType.CLINE.value: [
+        # replace_in_file with SEARCH/REPLACE block format
+        [
+            {"role": "user", "content": "Fix the typo 'recieve' in src/utils.py."},
+            {"role": "assistant", "content": "<replace_in_file>\n<path>src/utils.py</path>\n<diff>\n<<<<<<< SEARCH\ndef recieve_data(payload):\n=======\ndef receive_data(payload):\n>>>>>>> REPLACE\n</diff>\n</replace_in_file>"},
+        ],
+        # Two-turn: append to file — read first, then write full updated content
+        [
+            {"role": "user", "content": "Add a section to README.md."},
+            {"role": "assistant", "content": "<read_file>\n<path>README.md</path>\n</read_file>"},
+            {"role": "user", "content": "[Tool Result]\n# Project\n\nDescription here."},
+            {"role": "assistant", "content": "<write_to_file>\n<path>README.md</path>\n<content># Project\n\nDescription here.\n\n## Installation\n\nRun `npm install`.\n</content>\n</write_to_file>"},
         ],
     ],
 }

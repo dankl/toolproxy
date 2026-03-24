@@ -16,11 +16,14 @@ logger = logging.getLogger(__name__)
 class ClientType(Enum):
     ROO_CODE = "roo_code"
     OPEN_CODE = "open_code"
+    CLINE = "cline"
     GENERIC = "generic"
 
 
 _ROO_CODE_SIGNALS = frozenset({"attempt_completion", "write_to_file", "read_file", "apply_diff"})
 _OPEN_CODE_SIGNALS = frozenset({"bash", "edit", "glob", "grep"})
+# Cline uses replace_in_file (not apply_diff) as its edit tool — that's the distinguishing signal
+_CLINE_SIGNALS = frozenset({"replace_in_file"})
 
 # Canonical tool name mapping.
 # The model always sees and outputs ROO_CODE-style tool names (canonical).
@@ -126,10 +129,13 @@ _ROO_CODE_BUILTIN_TOOLS: frozenset = frozenset({
 def detect_client_type(tool_names: List[str]) -> ClientType:
     """Identify which agent framework is making the request based on its tool set."""
     names = set(tool_names)
-    if names & _ROO_CODE_SIGNALS:
-        return ClientType.ROO_CODE
     if names & _OPEN_CODE_SIGNALS:
         return ClientType.OPEN_CODE
+    # Cline: has replace_in_file but NOT apply_diff (Roo Code uses apply_diff instead)
+    if (names & _CLINE_SIGNALS) and "apply_diff" not in names:
+        return ClientType.CLINE
+    if names & _ROO_CODE_SIGNALS:
+        return ClientType.ROO_CODE
     return ClientType.GENERIC
 
 

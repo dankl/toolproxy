@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 class VLLMClient:
     """HTTP client for an OpenAI-compatible upstream LLM API."""
 
-    def __init__(self, base_url: str, model: str, api_key: str = "dummy-key", timeout: int = 180, max_retries: int = 3):
+    def __init__(self, base_url: str, model: str, api_key: str = "dummy-key", timeout: int = 180, max_retries: int = 3, retry_on_timeout: bool = False):
         """
         Initialize upstream LLM client.
 
@@ -28,6 +28,7 @@ class VLLMClient:
         self.api_key = api_key
         self.timeout = timeout
         self.max_retries = max_retries
+        self.retry_on_timeout = retry_on_timeout
         self.client = httpx.AsyncClient(
             timeout=httpx.Timeout(timeout),
             headers={"Authorization": f"Bearer {api_key}"}
@@ -96,7 +97,10 @@ class VLLMClient:
 
             except httpx.TimeoutException as e:
                 logger.warning(f"upstream timeout on attempt {attempt + 1}: {str(e)}")
-                if attempt == self.max_retries - 1:
+                # By default do NOT retry on timeout — OCI timeouts typically mean
+                # the model is stuck, not a transient network blip. Retrying just
+                # multiplies the user-visible wait time.
+                if not self.retry_on_timeout or attempt == self.max_retries - 1:
                     raise
                 # Exponential backoff
                 await asyncio.sleep(2 ** attempt)

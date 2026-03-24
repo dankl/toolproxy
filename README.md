@@ -1,6 +1,6 @@
 # toolproxy
 
-Tool-Call-Proxy für OpenAI-kompatible Sprachmodelle ohne nativen Function-Call-Support. Übersetzt OpenAI-native `tool_calls` in XML-Format und zurück — für jeden OpenAI-kompatiblen Client (Roo Code, opencode, etc.).
+Tool-Call-Proxy für OpenAI-kompatible Sprachmodelle ohne nativen Function-Call-Support. Übersetzt OpenAI-native `tool_calls` in XML-Format und zurück — für jeden OpenAI-kompatiblen Client (Roo Code, Cline, opencode, etc.).
 
 ## Getestet mit
 
@@ -17,10 +17,10 @@ Viele Modelle unterstützen native OpenAI `tool_calls` nicht zuverlässig — se
 ## Flow
 
 ```
-Client (Roo Code / opencode / curl)
+Client (Roo Code / Cline / opencode / curl)
   ↓  OpenAI JSON: messages + tools[]
 toolproxy :8007
-  ├─ Client erkennen (Roo Code / OpenCode / Generic)
+  ├─ Client erkennen (Roo Code / Cline / OpenCode / Generic)
   ├─ Tool-Namen kanonisieren (OpenCode: write→write_to_file, read→read_file)
   ├─ System-Prompt: XML-Tool-Definitionen ergänzen
   ├─ History normalisieren: tool_calls + role:tool → XML
@@ -33,6 +33,7 @@ toolproxy
   ├─ Partial XML rescue (abgeschnittene Responses)
   ├─ JSON-Fallback-Kaskade (wenn kein XML gefunden)
   ├─ Text-Synthesis (Prosa → write_to_file / attempt_completion)
+  ├─ Write Guard: Markdown in Config-Datei → ask_followup_question
   ├─ Schema-Remap: <path> → filePath (OpenCode)
   └─ Tool-Namen dekanonisieren (write_to_file→write, read_file→read für OpenCode)
   ↑  Standard OpenAI response mit tool_calls[]
@@ -43,25 +44,26 @@ Client
 
 Das Modell spricht immer **kanonische Tool-Namen** (ROO-Code-Stil). Client-spezifische Namen werden beim Eingang übersetzt und beim Ausgang zurückübersetzt — transparent für beide Seiten.
 
-| OpenCode (Client) | LLM (kanonisch) | Roo Code (Client) | Mapping |
-|---|---|---|---|
-| `read` | `read_file` | `read_file` | ✅ übersetzt |
-| `write` | `write_to_file` | `write_to_file` | ✅ übersetzt |
-| `list` | `list_files` | `list_files` | ✅ übersetzt |
-| `edit` | `edit` | *(kein Äquivalent)* | — passthrough |
-| `bash` | `bash` | *(kein Äquivalent)* | — passthrough |
-| `glob` | `glob` | *(kein Äquivalent)* | — passthrough |
-| `grep` | `grep` | *(kein Äquivalent)* | — passthrough |
-| `question` | `question` | *(kein Äquivalent)* | — passthrough |
-| `task` | `task` | *(kein Äquivalent)* | — passthrough |
-| `webfetch` | `webfetch` | *(kein Äquivalent)* | — passthrough |
-| `websearch` | `websearch` | *(kein Äquivalent)* | — passthrough |
-| `codesearch` | `codesearch` | *(kein Äquivalent)* | — passthrough |
-| `todowrite` | `todowrite` | *(kein Äquivalent)* | — passthrough |
-| `skill` | `skill` | *(kein Äquivalent)* | — passthrough |
-| *(kein Äquivalent)* | `apply_diff` | `apply_diff` | — nur Roo |
-| *(kein Äquivalent)* | `attempt_completion` | `attempt_completion` | — nur Roo |
-| *(kein Äquivalent)* | `execute_command` | `execute_command` | — nur Roo |
+| OpenCode (Client) | LLM (kanonisch) | Roo Code (Client) | Cline (Client) | Mapping |
+|---|---|---|---|---|
+| `read` | `read_file` | `read_file` | `read_file` | ✅ OpenCode übersetzt |
+| `write` | `write_to_file` | `write_to_file` | `write_to_file` | ✅ OpenCode übersetzt |
+| `list` | `list_files` | `list_files` | `list_files` | ✅ OpenCode übersetzt |
+| `bash` | `bash` | *(kein Äquivalent)* | *(kein Äquivalent)* | — passthrough |
+| `edit` | `edit` | *(kein Äquivalent)* | *(kein Äquivalent)* | — passthrough |
+| `glob` | `glob` | *(kein Äquivalent)* | *(kein Äquivalent)* | — passthrough |
+| `grep` | `grep` | *(kein Äquivalent)* | *(kein Äquivalent)* | — passthrough |
+| *(kein Äquivalent)* | `apply_diff` | `apply_diff` | *(kein Äquivalent)* | — nur Roo Code |
+| *(kein Äquivalent)* | `replace_in_file` | *(kein Äquivalent)* | `replace_in_file` | — nur Cline |
+| *(kein Äquivalent)* | `attempt_completion` | `attempt_completion` | `attempt_completion` | — passthrough |
+| *(kein Äquivalent)* | `execute_command` | `execute_command` | `execute_command` | — passthrough |
+| *(kein Äquivalent)* | `search_files` | `search_files` | `search_files` | — passthrough |
+| *(kein Äquivalent)* | `ask_followup_question` | `ask_followup_question` | `ask_followup_question` | — passthrough |
+| *(kein Äquivalent)* | `browser_action` | *(kein Äquivalent)* | `browser_action` | — nur Cline |
+| *(kein Äquivalent)* | `use_mcp_tool` | *(kein Äquivalent)* | `use_mcp_tool` | — nur Cline |
+| *(kein Äquivalent)* | `new_task` | `new_task` | `new_task` | — passthrough |
+
+**Cline-Erkennung:** `replace_in_file` ∈ Tools AND `apply_diff` ∉ Tools → CLINE. Cline-Tool-Namen sind identisch mit den kanonischen Namen — kein De-/Kanonisierungs-Schritt nötig.
 
 **Parameter-Mapping** (zusätzlich, via Schema-Remap):
 
@@ -126,7 +128,8 @@ Reihenfolge beim Parsen der Modell-Antwort:
 | `UPSTREAM_MODEL` | `your-model-name` | Modell-Name für Upstream |
 | `UPSTREAM_API_KEY` | `dummy-key` | API-Key für Upstream |
 | `REQUEST_TIMEOUT` | `180` | Timeout in Sekunden |
-| `MAX_RETRIES` | `2` | Wiederholungen bei Timeout |
+| `MAX_RETRIES` | `2` | Wiederholungen bei 5xx-Fehlern |
+| `RETRY_ON_TIMEOUT` | `false` | Timeout-Retries (Standard: aus — OCI-Timeouts sind kein transientes Problem, Retries multiplizieren nur die Wartezeit) |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` |
 
 ## Tool-Name-Aliasing
@@ -141,7 +144,8 @@ Das Modell halluziniert gelegentlich Tool-Namen. Bekannte Mappings:
 | `list_dir`, `ls`, `list_directory` | `list_files` |
 | `search`, `find`, `search_code` | `search_files` |
 | `search_codebase`, `semantic_search` | `codebase_search` |
-| `search_and_replace`, `search_replace`, `replace_in_file`, `find_replace` | `edit` |
+| `search_and_replace`, `search_replace`, `find_replace` | `edit` |
+| `replace_in_file` | `replace_in_file` (Cline) oder `edit` (Roo Code Fallback) |
 | `rename`, `move` | `move_file` → via Fixup zu `execute_command(mv)` |
 | `bash`, `run_command`, `execute`, `run`, `shell` | `execute_command` |
 | `ask_followup`, `ask_question`, `ask_user`, `followup_question` | `ask_followup_question` |
@@ -163,6 +167,26 @@ Wichtig: Roo Code muss auf **native tool_calls** konfiguriert sein (Standard ab 
 Das Modell ignoriert Roo-Code-Mode-Instruktionen (Architect, Ask, etc.) und folgt ausschließlich dem XML-System-Prompt des Proxys. Architect-Mode hat dieselben Tools verfügbar wie Code-Mode — Roo Code trennt die Modi nur über System-Prompt-Instruktionen ("denke als Architekt"), nicht über eingeschränkte Tool-Sets. Da das Modell diese kontextuellen Instruktionen nicht zuverlässig befolgt, verhält es sich in jedem Mode wie Code-Mode und versucht direkt Dateien zu schreiben.
 
 → Immer **Code-Mode** verwenden. Architect/Ask bringen bei diesem Modell keine andere Wirkung.
+
+### Cline
+
+Provider-Settings → Base URL: `http://localhost:8007`
+API Key: beliebig (z.B. `dummy-key`)
+
+Cline verwendet `replace_in_file` mit SEARCH/REPLACE-Blöcken (statt `apply_diff` wie Roo Code). Der Proxy erkennt Cline automatisch und instruiert das Modell entsprechend:
+
+```xml
+<replace_in_file>
+  <path>src/foo.py</path>
+  <diff>
+<<<<<<< SEARCH
+def old_function():
+=======
+def new_function():
+>>>>>>> REPLACE
+  </diff>
+</replace_in_file>
+```
 
 ### opencode
 ```json
@@ -226,7 +250,18 @@ python3 -m pytest -v
 python3 -m pytest -v tests/test_roundtrip.py::TestXmlToolCalls
 ```
 
-Aktuelle Test-Coverage: 65 Tests in `test_roundtrip.py` und `test_xml_parser.py`.
+Aktuelle Test-Coverage: 74 Unit-Tests gesamt (ohne Live-Tests).
+
+**Live E2E-Tests** (laufen gegen echtes Modell, kein Mock):
+```bash
+# oci-proxy muss auf localhost:8015 erreichbar sein (oder per SSH-Tunnel)
+python3 -m pytest -m live -v
+
+# Anderen Endpoint:
+TOOLPROXY_UPSTREAM_URL=http://localhost:8005/v1 python3 -m pytest -m live -v
+```
+
+Live-Tests decken ab: Write Guard, Repetitive-Loop-Detection, Timeout-Verhalten, alle Roo-Code- und OpenCode-Tools.
 
 ## Bekannte Modell-Eigenheiten & Proxy-Fixes
 
@@ -322,15 +357,40 @@ INFO  [abc12345] Text response looks like file content → synthesizing write_to
 INFO  [abc12345] Text response → synthesizing attempt_completion fallback
 ```
 
-### Success-Loop-Detection (implementiert)
-Nach 2+ erfolgreichen Write-Operationen in Folge injiziert der Proxy einen Stop-Hint in die letzte User-Message, bevor das Modell antwortet. Verhindert dass das Modell dasselbe Tool nochmal aufruft und Duplikate erzeugt.
+### Loop-Detection (implementiert)
+
+Zwei Detektoren, die beide einen CORRECTION-Hint in die letzte User-Message injizieren:
+
+**Success-Loop:** 2+ aufeinanderfolgende erfolgreiche Write-Operationen ohne echten User-Turn → das Modell schreibt Duplikate.
+
+**Repetitive-Loop:** Dasselbe Tool mit demselben Pfad 3× in Folge (z.B. `read_file` auf dieselbe Datei) → das Modell dreht sich im Kreis ohne Fortschritt.
+
+Ein echter User-Turn (keine `[Tool Result]`-Nachricht) setzt beide Zähler zurück.
 
 Im Log sichtbar als:
 ```
 WARNING [abc12345] SUCCESS LOOP: 2 consecutive successful write operations — injecting stop hint
+WARNING [abc12345] REPETITIVE LOOP: tool='read_file' called 3× in a row — injecting correction hint
 ```
 
-`apply_diff`-Similarity-Loops (gleicher Fehler 2x) noch nicht implementiert — erst Live-Erfahrung abwarten.
+### Write Guard (implementiert)
+
+Wenn das Modell Markdown-Dokumentation in eine Config-Datei schreiben will (`application.yml`, `pom.xml`, `build.gradle`, etc.), fängt der Guard es ab — defence-in-depth:
+
+1. **Priming-Regel #7** im System-Prompt verhindert es in der Regel direkt — das Modell wählt selbst eine `.md`-Datei
+2. **Fallback** (z.B. wenn System-Prompt durch OCI gedroppt wird): Guard ersetzt den `write_to_file`-Call durch `ask_followup_question` — der User wird gefragt wo die Doku hin soll
+3. Wenn `ask_followup_question` nicht im Tool-Set: WARNING im Log, Write passiert durch
+
+Im Log sichtbar als:
+```
+WARNING [abc12345] WRITE GUARD: model tried to write markdown docs into 'application.yml' → replacing with ask_followup_question
+```
+
+### Kein Retry bei Timeout (implementiert)
+
+Standard: `RETRY_ON_TIMEOUT=false`. Bei einem OCI-Timeout wird der Request nicht wiederholt — das Modell ist in dem Fall in der Regel hängengeblieben, kein transientes Netzwerkproblem. Mit dem alten Default (retry) wartete Roo Code bis zu 3 × 180s = 9 Minuten, bevor eine 502-Fehlermeldung kam. Jetzt kommt die 502 nach dem ersten Timeout.
+
+Opt-in Retry für Endpoints mit bekannten transiente Timeouts: `RETRY_ON_TIMEOUT=true`.
 
 ---
 
@@ -356,6 +416,8 @@ INFO  [abc12345] Text response → synthesizing attempt_completion fallback ← 
 INFO  [abc12345] Schema remap write_to_file: 'path' → 'filePath'         ← Parameter-Remap (OpenCode)
 INFO  [abc12345] No tool calls found — returning text response           ← Reine Textantwort
 WARNING [abc12345] SUCCESS LOOP: 2 consecutive successful write operations — injecting stop hint
+WARNING [abc12345] REPETITIVE LOOP: tool='read_file' called 3× in a row — injecting correction hint
+WARNING [abc12345] WRITE GUARD: model tried to write markdown docs into 'application.yml' → replacing with ask_followup_question
 ```
 
 Nur bei `LOG_LEVEL=DEBUG` zusätzlich sichtbar:

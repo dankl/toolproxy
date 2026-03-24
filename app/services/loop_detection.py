@@ -1,10 +1,13 @@
 """
-Success-loop detection for toolproxy.
+Loop detection for toolproxy.
 
-Detects when write-type tools keep succeeding but the model keeps calling them
-again, and returns a stop-hint string to inject into the conversation.
+Two detectors:
+1. detect_success_loop  — write-type tools keep succeeding but model calls them again.
+2. detect_repetitive_tool_loop — model calls the same tool with the same key argument
+   repeatedly, regardless of success/failure (e.g. read_file on the same path 3× in a row).
 """
 import logging
+import re
 from typing import Dict, List, Optional
 
 from app.services.tool_mapping import ClientType
@@ -78,4 +81,98 @@ def detect_success_loop(
         f"STOP: The file operation has already succeeded {success_count} times. "
         "Do NOT repeat the tool call — you are creating duplicates. "
         "Call attempt_completion to report that the task is done."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Repetitive tool-call loop detection
+# ---------------------------------------------------------------------------
+
+# Regex to extract the outermost XML tool tag name and its <path> child (if any).
+# Matches: <tool_name ...>...<path>value</path>...</tool_name>
+_XML_TOOL_RE = re.compile(r"<([a-z_]+)[\s>]", re.IGNORECASE)
+_XML_PATH_RE = re.compile(r"<(?:path|filePath)>([^<]{1,300})</(?:path|filePath)>", re.IGNORECASE)
+
+# How many consecutive identical calls before we fire the hint.
+_REPETITIVE_THRESHOLD = 3
+
+
+def _extract_tool_call_key(content: str) -> Optional[str]:
+    """
+    Extract a deduplication key from an assistant message that contains an XML
+    tool call.  Key format: "<tool_name>|<path>" or "<tool_name>" if no path.
+    """
+    tool_match = _XML_TOOL_RE.search(content)
+    if not tool_match:
+        return None
+    tool_name = tool_match.group(1).lower()
+    path_match = _XML_PATH_RE.search(content)
+    if path_match:
+        return f"{tool_name}|{path_match.group(1).strip()}"
+    return tool_name
+
+
+def detect_repetitive_tool_loop(
+    messages: List[Dict],
+    request_id: str = "",
+    client_type: ClientType = ClientType.ROO_CODE,
+) -> Optional[str]:
+    """
+    Detect when the model calls the exact same tool with the same path/args
+    N consecutive times (e.g. read_file on the same file over and over).
+
+    Scans the last 12 messages, looking at assistant turns only.
+    Resets the counter when a genuine user message (non-tool-result) appears.
+    """
+    recent = messages[-12:] if len(messages) > 12 else messages
+
+    consecutive: int = 0
+    last_key: Optional[str] = None
+
+    for msg in recent:
+        role = msg.get("role", "")
+        content = str(msg.get("content", ""))
+
+        if role == "user":
+            if "[Tool Result]" not in content:
+                # Genuine user instruction — reset
+                consecutive = 0
+                last_key = None
+            continue
+
+        if role != "assistant":
+            continue
+
+        key = _extract_tool_call_key(content)
+        if key is None:
+            # No tool call in this assistant turn — reset streak
+            consecutive = 0
+            last_key = None
+            continue
+
+        if key == last_key:
+            consecutive += 1
+            logger.debug(f"[{request_id}] repetitive_loop: key={key!r} count={consecutive}")
+        else:
+            consecutive = 1
+            last_key = key
+
+    if consecutive < _REPETITIVE_THRESHOLD:
+        return None
+
+    tool_name = (last_key or "").split("|")[0]
+    logger.warning(
+        f"[{request_id}] REPETITIVE LOOP: tool={tool_name!r} called {consecutive}× "
+        f"in a row — injecting correction hint"
+    )
+    if client_type == ClientType.OPEN_CODE:
+        return (
+            f"STOP: You have called '{tool_name}' {consecutive} times in a row "
+            "without making progress. Re-read the task and try a different approach. "
+            "Do not repeat the same tool call again."
+        )
+    return (
+        f"STOP: You have called '{tool_name}' {consecutive} times in a row "
+        "without making progress. Re-read the task and use a different approach. "
+        "If the task is already done, call attempt_completion."
     )

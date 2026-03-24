@@ -28,7 +28,16 @@ class Settings(BaseSettings):
 
     # HTTP
     request_timeout: int = Field(default=180, description="Upstream request timeout in seconds")
-    max_retries: int = Field(default=2, description="Max retries on upstream timeout")
+    max_retries: int = Field(default=2, description="Max retries on upstream 5xx errors")
+    retry_on_timeout: bool = Field(
+        default=False,
+        description=(
+            "Retry upstream request on timeout. Default False — OCI timeouts are usually "
+            "caused by the model being stuck, not a transient network issue. Retrying just "
+            "multiplies the wait time without benefit. Set True only if your upstream is "
+            "known to have intermittent timeouts."
+        ),
+    )
 
     # Logging
     log_level: str = Field(default="INFO", description="Log level: DEBUG, INFO, WARNING, ERROR")

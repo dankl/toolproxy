@@ -6,7 +6,7 @@ support native function calls. Sits between any OpenAI-compatible client and
 any OpenAI-compatible upstream LLM (e.g. LiteLLM, vLLM, custom endpoints).
 
 Flow:
-  Client (Roo Code, opencode, etc.)
+  Client (Roo Code, Cline, opencode, etc.)
     ↓  OpenAI JSON with tools[] array
   toolproxy (Port 8007)
     ↓  XML System Prompt + XML-normalised history
@@ -27,7 +27,8 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.config import settings
-from app.services.loop_detection import detect_success_loop
+from app.services.file_write_guard import guard_write_to_file
+from app.services.loop_detection import detect_repetitive_tool_loop, detect_success_loop
 from app.services.message_normalizer import normalize_messages
 from app.services.priming import inject_priming
 from app.services.text_synthesis import synthesize_tool_call_from_text
@@ -56,7 +57,7 @@ from app.services.xml_parser import (
 )
 from app.services.xml_prompt_builder import build_xml_system_prompt
 
-VERSION = "1.1.4"  # move_file/rename_file → execute_command(mv); priming uses execute_command
+VERSION = "1.3.0"  # Cline client support (replace_in_file / SEARCH-REPLACE format)
 
 logging.basicConfig(
     level=getattr(logging, settings.log_level),
@@ -84,6 +85,7 @@ async def lifespan(app: FastAPI):
         api_key=settings.upstream_api_key,
         timeout=settings.request_timeout,
         max_retries=settings.max_retries,
+        retry_on_timeout=settings.retry_on_timeout,
     )
     yield
     await upstream_client.close()
@@ -209,7 +211,10 @@ async def chat_completions(request: Dict[str, Any]):
         messages = inject_priming(messages, canonical_tools, client_type)
 
     # 3b. Loop detection — append stop hint to last user message if model is looping
-    loop_hint = detect_success_loop(messages, request_id, client_type)
+    loop_hint = (
+        detect_success_loop(messages, request_id, client_type)
+        or detect_repetitive_tool_loop(messages, request_id, client_type)
+    )
     if loop_hint:
         for i in range(len(messages) - 1, -1, -1):
             if messages[i].get("role") == "user":
@@ -261,7 +266,7 @@ async def chat_completions(request: Dict[str, Any]):
 
         # Also try Roo Code built-in tools not always present in the tools[] array
         # (e.g. delete_file, rename_file — valid Roo tools the model may call)
-        if not xml_calls and client_type == ClientType.ROO_CODE:
+        if not xml_calls and client_type in (ClientType.ROO_CODE, ClientType.CLINE):
             extra = [n for n in _ROO_CODE_BUILTIN_TOOLS if n not in tool_names]
             if extra:
                 xml_calls, _ = extract_xml_tool_calls(content, extra, request_id)
@@ -329,6 +334,12 @@ async def chat_completions(request: Dict[str, Any]):
     # 10. RESCUE: if attempt_completion.result contains XML tool calls, extract them
     if tool_calls:
         tool_calls = rescue_xml_in_attempt_completion(tool_calls, tool_names, request_id)
+        assistant_message["tool_calls"] = tool_calls
+
+    # 10b. WRITE GUARD: intercept markdown docs written into config files (application.yml etc.)
+    #      Replaces bad write with ask_followup_question if available; logs warning otherwise.
+    if tool_calls:
+        tool_calls = guard_write_to_file(tool_calls, request_id, canonical_tools)
         assistant_message["tool_calls"] = tool_calls
 
     # 11. LIMIT: only return the first tool call — model often batches multiple calls but

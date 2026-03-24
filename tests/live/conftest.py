@@ -157,6 +157,8 @@ OPEN_CODE_TOOLS = [
 
 # ── Fixture ───────────────────────────────────────────────────────────────────
 
+import os
+
 @pytest.fixture(scope="module")
 def live(client):
     """
