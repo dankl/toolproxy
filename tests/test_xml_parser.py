@@ -68,6 +68,31 @@ class TestFixXmlString:
         root = ET.fromstring(fixed)
         assert "<tag>" in root.find("diff").text
 
+    def test_diff_with_search_replace_markers(self):
+        """Regression: <<<<<<< SEARCH markers inside <diff> must survive round-trip."""
+        xml = (
+            "<apply_diff>"
+            "<path>tsconfig.json</path>"
+            '<diff>\n<<<<<<< SEARCH\n:start_line:7\n-------\n  "include": ["src"]\n=======\n  "include": ["src/**/*"]\n>>>>>>> REPLACE\n</diff>'
+            "</apply_diff>"
+        )
+        fixed = fix_xml_string(xml)
+        root = ET.fromstring(fixed)
+        assert "<<<<<<< SEARCH" in root.find("diff").text
+        assert ">>>>>>> REPLACE" in root.find("diff").text
+
+    def test_missing_closing_diff_tag(self):
+        """Regression: model sometimes omits </diff> — should be auto-inserted."""
+        xml = (
+            "<apply_diff>"
+            "<path>tsconfig.json</path>"
+            '<diff>\n<<<<<<< SEARCH\n:start_line:7\n-------\n  "include": ["src"]\n=======\n  "include": ["src/**/*"]\n>>>>>>> REPLACE\n'
+            "</apply_diff>"
+        )
+        fixed = fix_xml_string(xml)
+        root = ET.fromstring(fixed)
+        assert "<<<<<<< SEARCH" in root.find("diff").text
+
     def test_escapes_angle_brackets_in_result(self):
         xml = (
             "<attempt_completion>"
@@ -241,6 +266,20 @@ class TestExtractXmlToolCalls:
         # Only the outer attempt_completion should be extracted
         assert len(calls) == 1
         assert calls[0].name == "attempt_completion"
+
+    def test_jsx_content_returned_as_string(self):
+        """Regression: JSX inside <content> is valid XML — must come back as string, not dict."""
+        content = (
+            "<write_to_file>"
+            "<path>src/App.tsx</path>"
+            "<content>const App = () => {\n  return (\n    <div><h1>Hello</h1></div>\n  );\n};\nexport default App;\n</content>"
+            "</write_to_file>"
+        )
+        calls, _ = extract_xml_tool_calls(content, TOOL_NAMES)
+        assert len(calls) == 1
+        result = calls[0].arguments["content"]
+        assert isinstance(result, str), f"content should be str, got {type(result)}"
+        assert "<div>" in result
 
     def test_unknown_tool_not_extracted(self):
         content = "<update_todo_list>[{...}]</update_todo_list>"

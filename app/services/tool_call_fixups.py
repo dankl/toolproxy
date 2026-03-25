@@ -388,3 +388,51 @@ def rescue_xml_in_attempt_completion(
             return convert_xml_tool_calls_to_openai_format(xml_calls)
 
     return tool_calls
+
+
+def fix_ask_followup_question_params(
+    tool_calls: List[Dict], request_id: str
+) -> List[Dict]:
+    """
+    Normalize ask_followup_question arguments.
+
+    The model sometimes outputs `follow_up` as a newline-separated string
+    instead of a JSON array.  Roo Code requires an array and rejects the
+    call with "Missing value for required parameter 'follow_up'" otherwise.
+
+    Example bad input:
+        "follow_up": "Show output\\nRestart server\\nCheck config"
+    Fixed output:
+        "follow_up": ["Show output", "Restart server", "Check config"]
+    """
+    result = []
+    for tc in tool_calls:
+        if tc.get("function", {}).get("name") != "ask_followup_question":
+            result.append(tc)
+            continue
+
+        try:
+            args = json.loads(tc["function"].get("arguments", "{}"))
+        except json.JSONDecodeError:
+            result.append(tc)
+            continue
+
+        follow_up = args.get("follow_up")
+        if isinstance(follow_up, str):
+            items = [s.strip() for s in follow_up.splitlines() if s.strip()]
+            if items:
+                args["follow_up"] = items
+                logger.info(
+                    f"[{request_id}] ask_followup_question: follow_up string → array "
+                    f"({len(items)} items)"
+                )
+                tc = {
+                    **tc,
+                    "function": {
+                        "name": "ask_followup_question",
+                        "arguments": json.dumps(args),
+                    },
+                }
+
+        result.append(tc)
+    return result

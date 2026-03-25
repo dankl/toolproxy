@@ -9,6 +9,7 @@ Primary prevention: the system prompt (xml_prompt_builder.py rule #7) tells the
 model not to do this. This guard is a safety net for cases where the system
 prompt is dropped by the upstream adapter (known OCI behaviour).
 """
+import fnmatch
 import json
 import logging
 import os
@@ -18,25 +19,59 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Config files whose content should never be markdown documentation.
+# Config/source files whose content should never be markdown documentation.
+# Exact basenames:
 _PROTECTED_CONFIG_NAMES = {
-    "application.yml",
-    "application.yaml",
-    "application.properties",
-    "pom.xml",
-    "build.gradle",
-    "build.gradle.kts",
-    "settings.gradle",
-    "settings.gradle.kts",
-    "settings.xml",
-    "web.xml",
-    "beans.xml",
-    "context.xml",
-    "logback.xml",
-    "logback-spring.xml",
-    "log4j2.xml",
-    "log4j2.properties",
+    # Java / Spring
+    "application.yml", "application.yaml", "application.properties",
+    "pom.xml", "build.gradle", "build.gradle.kts",
+    "settings.gradle", "settings.gradle.kts", "settings.xml",
+    "web.xml", "beans.xml", "context.xml",
+    "logback.xml", "logback-spring.xml",
+    "log4j2.xml", "log4j2.properties",
+    "persistence.xml", "hibernate.cfg.xml",
+    "checkstyle.xml", "sonar-project.properties",
+    # React / Angular / Node
+    "package.json", "package-lock.json",
+    "tsconfig.json", "angular.json", "nx.json",
+    "jest.config.js", "jest.config.ts",
+    "karma.conf.js",
+    "vite.config.js", "vite.config.ts",
+    "webpack.config.js", "webpack.config.ts",
+    "babel.config.js", "babel.config.json",
+    "postcss.config.js", "postcss.config.ts",
+    "tailwind.config.js", "tailwind.config.ts",
+    ".eslintrc", ".eslintrc.json", ".eslintrc.yml", ".eslintrc.yaml", ".eslintrc.js",
+    ".prettierrc", ".prettierrc.json",
+    # Helm
+    "Chart.yaml", "Chart.yml",
+    "values.yaml", "values.yml",
+    # CI/CD & containers
+    "Dockerfile", "docker-compose.yml", "docker-compose.yaml",
+    ".gitlab-ci.yml",
+    # Scripting / build
+    "Makefile",
 }
+
+# Glob patterns matched against the basename (fnmatch):
+_PROTECTED_CONFIG_PATTERNS = [
+    # Spring profiles: application-dev.yml, application-prod.properties, …
+    "application-*.yml", "application-*.yaml", "application-*.properties",
+    # tsconfig variants: tsconfig.app.json, tsconfig.spec.json, …
+    "tsconfig.*.json",
+    # Helm environment values: values-dev.yaml, values-prod.yml, …
+    "values-*.yaml", "values-*.yml",
+    # GitHub Actions workflows
+    "*.github-workflow.yml",
+    # Generic Java XML configs
+    "*-context.xml", "*-beans.xml",
+]
+
+
+def _is_protected_config(filename: str) -> bool:
+    if filename in _PROTECTED_CONFIG_NAMES:
+        return True
+    return any(fnmatch.fnmatch(filename, pat) for pat in _PROTECTED_CONFIG_PATTERNS)
 
 # Minimum number of markdown heading lines in the first 30 lines to flag content as docs.
 _MD_HEADING_THRESHOLD = 2
@@ -91,7 +126,7 @@ def guard_write_to_file(
         content: str = args.get("content", "") or ""
         filename = os.path.basename(path)
 
-        if filename not in _PROTECTED_CONFIG_NAMES or not _is_markdown_content(content):
+        if not _is_protected_config(filename) or not _is_markdown_content(content):
             result.append(tc)
             continue
 

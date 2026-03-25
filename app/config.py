@@ -41,6 +41,10 @@ class Settings(BaseSettings):
 
     # Logging
     log_level: str = Field(default="INFO", description="Log level: DEBUG, INFO, WARNING, ERROR")
+    audit_log_path: str = Field(
+        default="/logs/toolproxy-audit.jsonl",
+        description="Path for the anonymized audit log (JSON Lines). Empty string disables it.",
+    )
 
 
 settings = Settings()

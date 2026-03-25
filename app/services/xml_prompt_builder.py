@@ -27,13 +27,19 @@ def json_schema_to_xml_example(tool_def: Dict) -> str:
 def _build_rules_roo_code() -> str:
     return """## RULES
 
-1. Your ENTIRE response must be exactly one XML tool call — nothing else
+1. Your ENTIRE response must be exactly ONE XML tool call — nothing else.
+   NEVER output multiple tool calls in one response.
+   Always wait for the tool result before calling the next tool.
 2. Use ONLY tool names from the list above — NEVER invent tool names
 3. To CREATE a new file: use `write_to_file` with the COMPLETE file content.
    To MODIFY an existing file:
    - First call `read_file` to get the current content
    - Then use `apply_diff` to change specific sections, OR `write_to_file` with the COMPLETE updated content
    - NEVER use `write_to_file` with only the new/changed portion — this destroys existing content
+   PATH CONSISTENCY: If the project has subfolders (e.g. `backend/`, `frontend/`), ALL files for
+   that component MUST use that prefix consistently.
+   WRONG: `backend/pom.xml` + `src/main/java/...`  ← mixed roots
+   CORRECT: `backend/pom.xml` + `backend/src/main/java/...`  ← consistent
 4. NEVER output file content as plain text — always call the tool
 5. When the task is complete, call `attempt_completion`
    → A task is ONLY complete when ALL required files exist on disk and all required actions are done.
@@ -97,6 +103,29 @@ CORRECT — perform each action first, then summarize in plain text:
 </attempt_completion>
 ```
 
+## CRITICAL EXAMPLE — writing multiple files
+
+WRONG (never batch multiple tool calls in one response):
+```
+<write_to_file><path>src/main.tsx</path><content>...</content></write_to_file>
+<write_to_file><path>src/App.tsx</path><content>...</content></write_to_file>
+```
+
+CORRECT — one call per response, wait for result, then continue:
+```
+<write_to_file>
+<path>src/main.tsx</path>
+<content>...</content>
+</write_to_file>
+```
+[wait for tool result, then in the next response:]
+```
+<write_to_file>
+<path>src/App.tsx</path>
+<content>...</content>
+</write_to_file>
+```
+
 ## FORBIDDEN FORMATS
 
 NEVER use any of these formats — they will be ignored:
@@ -106,41 +135,20 @@ NEVER use any of these formats — they will be ignored:
 - YAML-style like `[write_to_file]\npath: foo\ncontent: |` — WRONG
 - Plain text descriptions of what you would do — WRONG
 - Describing updated file content in a code block — WRONG (see example below)
+- Simulated tool results like `[Tool Result]\nFile: foo.ts\n1 | ...` — WRONG
+  `[Tool Result]` is SYSTEM output that appears in user messages. NEVER write it yourself.
+  If a file appears truncated or unreadable, call `write_to_file` with the new content directly.
 
-## CRITICAL EXAMPLE — updating a file
+## CRITICAL EXAMPLE — updating or extending a file
 
-WRONG (never do this):
+WRONG (never describe file content as text, and never write only the new part):
 ```
-Hier ist der aktualisierte guides/ai-guide.md:
-```markdown
-# AI Guide
-...
-```
-```
-
-CORRECT (always do this):
-```
-<write_to_file>
-<path>guides/ai-guide.md</path>
-<content># AI Guide
-...
-</content>
-</write_to_file>
+Hier ist der aktualisierte guides/ai-guide.md: ...
 ```
 
-No matter what language you think in — your ENTIRE response must be the XML tool call. No preamble, no explanation, no code fences around the XML.
-
-## CRITICAL EXAMPLE — adding content to an existing file
-
-WRONG (never do this — overwrites the entire file with only the new part):
+WRONG (never write only the new/changed portion — this destroys existing content):
 ```
-<write_to_file>
-<path>guides/ai-guide.md</path>
-<content>## RagFlow
-
-Only the new section...
-</content>
-</write_to_file>
+<write_to_file><path>guides/ai-guide.md</path><content>## RagFlow\nOnly the new section...</content></write_to_file>
 ```
 
 CORRECT option 1 — read the file first, then write the COMPLETE updated content:
@@ -172,7 +180,9 @@ CORRECT option 2 — use apply_diff to append a section:
 def _build_rules_cline() -> str:
     return """## RULES
 
-1. Your ENTIRE response must be exactly one XML tool call — nothing else
+1. Your ENTIRE response must be exactly ONE XML tool call — nothing else.
+   NEVER output multiple tool calls in one response.
+   Always wait for the tool result before calling the next tool.
 2. Use ONLY tool names from the list above — NEVER invent tool names
 3. To CREATE a new file: use `write_to_file` with the COMPLETE file content.
    To MODIFY an existing file:

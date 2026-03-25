@@ -250,7 +250,7 @@ python3 -m pytest -v
 python3 -m pytest -v tests/test_roundtrip.py::TestXmlToolCalls
 ```
 
-Aktuelle Test-Coverage: 74 Unit-Tests gesamt (ohne Live-Tests).
+Aktuelle Test-Coverage: 94 Unit-Tests gesamt (ohne Live-Tests).
 
 **Live E2E-Tests** (laufen gegen echtes Modell, kein Mock):
 ```bash
@@ -289,6 +289,11 @@ INFO  [abc12345] apply_diff all-additions on 'src/Main.java' → write_to_file
 ### Mehrere Tool Calls pro Turn → Limit 1 (implementiert)
 Das Modell gibt oft 3–5 Tool Calls in einem einzigen Response zurück. Roo Code verarbeitet parallele Calls nicht zuverlässig. Der Proxy gibt immer nur den **ersten** Call zurück; die restlichen werden verworfen. Das erzwingt sequenzielle Ausführung: ein Schritt → Ergebnis → nächster Schritt.
 
+Adressiert durch:
+- **Rule 1** im System-Prompt: *"NEVER output multiple tool calls in one response. Always wait for the tool result before calling the next tool."*
+- **WRONG/CORRECT-Beispiel** im System-Prompt zeigt explizit, dass Batching verboten ist
+- **Limit-Step** im Proxy (Step 11 in `main.py`): überschüssige Calls werden still verworfen
+
 Im Log sichtbar als:
 ```
 INFO  [abc12345] 3 tool calls → keeping only first ('write_to_file')
@@ -306,15 +311,27 @@ Das Modell neigt dazu, nach 1–2 Datei-Writes sofort `attempt_completion` aufzu
 > *"A task is ONLY complete when ALL required files exist on disk. Write every file with write_to_file first, THEN call attempt_completion."*
 
 ### Sonderzeichen in Datei-Inhalten (implementiert)
-Wenn das Modell Dateien mit Code-Inhalten schreibt, enthält `<content>` oft XML-ungültige Zeichen:
+Wenn das Modell Dateien mit Code-Inhalten schreibt, enthält `<content>` oft XML-ungültige oder -problematische Zeichen:
 
-| Zeichen | Kontext | Beispiel |
+| Zeichen / Muster | Kontext | Beispiel |
 |---|---|---|
 | `&&` | Shell-Befehle | `npm install && pip install` |
 | `&` | Standalone-Operator | `Linter & Formatter` |
 | `=>` | JavaScript Arrow Functions | `(req, res) => { ... }` |
+| `<div>`, `<h1>`, ... | JSX / HTML in React-Dateien | `return (<div>...</div>)` |
+| `<<<<<<< SEARCH` | apply_diff SEARCH/REPLACE-Marker | Roo-Code/Cline-Diffs |
 
-Der XML-Parser schlägt fehl, wenn solche Zeichen unescaped im `<content>`-Tag auftreten. `fix_xml_string` (in `services/xml_parser.py`) pre-escaped diese Zeichen automatisch vor dem Parsen. Betrifft die Tags `content`, `diff`, `result` und `output`.
+`fix_xml_string` (in `services/xml_parser.py`) escaped die Inhalte der Tags `content`, `diff`, `result` und `output` **vor** dem ET-Parsing — nicht erst bei einem `ParseError`. Das verhindert, dass zufällig valides XML (z.B. JSX-Struktur `<div><h1>...</h1></div>`) fälschlicherweise als XML-Kind-Elemente geparst wird und `content` als dict statt als String landet.
+
+### apply_diff ohne schließenden `</diff>`-Tag (implementiert)
+Das Modell öffnet `<diff>` korrekt, schließt es aber gelegentlich nicht — es fehlt `</diff>` vor `</apply_diff>`. Dadurch findet `fix_xml_string` keinen Match für den `<diff>`-Block, die `<<<<<<< SEARCH`-Marker bleiben unescaped, und ET bricht mit `not well-formed (invalid token)` ab.
+
+`fix_xml_string` erkennt diesen Fall und fügt das fehlende `</diff>` automatisch ein, **bevor** das Escaping läuft — so greift der Escape-Regex danach korrekt.
+
+Im Log sichtbar als (nach Fix: kein Warning mehr):
+```
+WARNING [abc12345] Failed to parse XML tool call: not well-formed (invalid token): line 4, column 1
+```
 
 ### Abgeschnittene XML-Responses — Partial XML rescue (implementiert)
 Das Modell gibt gelegentlich `<write_to_file>`-Responses zurück, die keinen schließenden `</write_to_file>`-Tag haben (Response wird vom Upstream abgeschnitten). Der reguläre Ausdruck findet dann keine Übereinstimmung, und es gibt keine `WARNING`-Logzeile — der Response landet ohne Fix in `attempt_completion`.
@@ -373,6 +390,38 @@ WARNING [abc12345] SUCCESS LOOP: 2 consecutive successful write operations — i
 WARNING [abc12345] REPETITIVE LOOP: tool='read_file' called 3× in a row — injecting correction hint
 ```
 
+### Doppelte Tool-Call-IDs (implementiert)
+
+Das Modell wiederholt identische Tool-Calls (gleicher Name, gleiche Argumente) wenn es in einer Schleife steckt — z.B. mehrfaches `pkill` nach bereits gestoppten Prozessen. Die ursprüngliche Implementierung verwendete einen MD5-Hash über den XML-Content als ID, was bei identischem Content dieselbe ID erzeugte. Roo Code bricht mit "failure in the model's thought process" ab wenn es eine ID zum zweiten Mal sieht.
+
+Fix: Jede Tool-Call-ID enthält jetzt einen kurzen Zufalls-Suffix (`secrets.token_hex(2)`) — IDs sind immer eindeutig, auch bei identischem Content.
+
+Im Log sichtbar als:
+```
+INFO  [abc12345] XML parsed 1 tool call(s): execute_command   ← call_abc12345_execute_command_3f7a
+INFO  [abc12345] XML parsed 1 tool call(s): execute_command   ← call_abc12345_execute_command_8b2c (different!)
+```
+
+### ask_followup_question follow_up: String → Array (implementiert)
+
+Das Modell gibt `follow_up` gelegentlich als Newline-getrennten String statt als JSON-Array aus. Roo Code erwartet ein Array und bricht mit `"Missing value for required parameter 'follow_up'"` ab — der Nutzer sieht einen harten Roo-Code-Fehler.
+
+Fix: `fix_ask_followup_question_params` (Step 11) splittet den String an Zeilenumbrüchen zu einem Array.
+
+Beispiel:
+```
+Model output:  "follow_up": "Show output\nRestart server\nCheck config"
+Proxy fixes:   "follow_up": ["Show output", "Restart server", "Check config"]
+```
+
+### [Tool Result]-Halluzination bei gekürzten Dateien (implementiert)
+
+Roo Code kürzt große Dateien bei `read_file` (Ausgabe endet mit `...`). Das Modell interpretiert das als "Datei korrupt" und schreibt daraufhin `[Tool Result]`-Blöcke und Dateiinhalte direkt in seinen Response-Text — statt `write_to_file` aufzurufen. Die Dateien werden nie tatsächlich geschrieben; Roo Code bricht ab.
+
+Fix (zweistufig, defense-in-depth):
+1. **System-Prompt** (FORBIDDEN FORMATS): `[Tool Result]` ist explizit verboten — "NEVER write it yourself, call write_to_file directly"
+2. **Priming**: Neue 2-Turn Static Sequence zeigt das korrekte Verhalten: truncated file result → direkt `write_to_file` aufrufen, kein Fake-Output
+
 ### Write Guard (implementiert)
 
 Wenn das Modell Markdown-Dokumentation in eine Config-Datei schreiben will (`application.yml`, `pom.xml`, `build.gradle`, etc.), fängt der Guard es ab — defence-in-depth:
@@ -414,6 +463,7 @@ INFO  [abc12345] 3 tool calls → keeping only first ('write_to_file')     ← M
 INFO  [abc12345] Text response looks like file content → synthesizing write_to_file(...)  ← Text-Synthesis
 INFO  [abc12345] Text response → synthesizing attempt_completion fallback ← Synthesis-Fallback
 INFO  [abc12345] Schema remap write_to_file: 'path' → 'filePath'         ← Parameter-Remap (OpenCode)
+INFO  [abc12345] ask_followup_question: follow_up string → array (3 items) ← follow_up Fixup
 INFO  [abc12345] No tool calls found — returning text response           ← Reine Textantwort
 WARNING [abc12345] SUCCESS LOOP: 2 consecutive successful write operations — injecting stop hint
 WARNING [abc12345] REPETITIVE LOOP: tool='read_file' called 3× in a row — injecting correction hint

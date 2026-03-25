@@ -118,6 +118,64 @@ class TestShellInjection:
         )
 
 
+class TestApplyDiffSearchReplaceMarkers:
+    """
+    Bug: apply_diff with <<<<<<< SEARCH markers failed to parse because the diff
+    content is invalid XML. fix_xml_string must escape the markers so ET can parse them.
+
+    If the bug is present: proxy returns attempt_completion fallback instead of apply_diff
+    If the bug is fixed:   proxy returns apply_diff with diff argument as a string
+    """
+
+    def test_apply_diff_search_replace_parsed_as_string(self, live):
+        messages = [
+            {"role": "system", "content": "You are a coding assistant. Use tools to complete tasks."},
+            {"role": "user", "content": "Change the line 'include: [\"src\"]' to 'include: [\"src/**/*\"]' in tsconfig.json using apply_diff."},
+            {"role": "assistant", "content": None, "tool_calls": [{
+                "id": "call_001",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": '{"path": "tsconfig.json"}'},
+            }]},
+            {"role": "tool", "tool_call_id": "call_001", "content": '{\n  "compilerOptions": {},\n  "include": ["src"]\n}\n'},
+            {"role": "user", "content": "Now apply the change with apply_diff."},
+        ]
+        resp = post_multi_turn(live, ROO_CODE_TOOLS, messages)
+        name, args = parse_tool_call(resp)
+
+        assert name == "apply_diff", f"Expected apply_diff, got {name!r}"
+        diff = args.get("diff", "")
+        assert isinstance(diff, str), f"diff must be a string, got {type(diff)}"
+        assert diff.strip(), "diff must not be empty"
+
+
+class TestWriteToFileJsxContent:
+    """
+    Bug: write_to_file with JSX content (e.g. <div>, <h1>) is accidentally valid XML.
+    ET parsed the content tag as having child elements → xml_element_to_dict returned
+    a dict instead of a string → audit_log crashed with AttributeError.
+
+    If the bug is present: proxy returns 500 or content argument is a dict
+    If the bug is fixed:   proxy returns write_to_file with content as a plain string
+    """
+
+    def test_jsx_content_argument_is_string(self, live):
+        resp = post(
+            live,
+            ROO_CODE_TOOLS,
+            "Write a minimal React component to src/App.tsx. "
+            "It should render a <div> with an <h1> saying 'Hello'.",
+        )
+        name, args = parse_tool_call(resp)
+
+        assert name == "write_to_file", f"Expected write_to_file, got {name!r}"
+        content = args.get("content", "")
+        assert isinstance(content, str), (
+            f"content must be a string, got {type(content)} — "
+            "JSX inside <content> was likely parsed as XML child elements"
+        )
+        assert content.strip(), "content must not be empty"
+
+
 class TestMultiTurnNormalization:
     """
     Finding: tool_calls key not removed from assistant messages after normalization.

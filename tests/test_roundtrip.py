@@ -1670,6 +1670,68 @@ class TestRenameHallucination:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# History normalisation: tool_calls stripped before reaching upstream
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestHistoryNormalizationUpstream:
+    """
+    Regression for the bug where assistant messages in history still had the
+    tool_calls key after normalization, sending both XML (content) and native
+    tool_calls to the upstream in the same message.
+    """
+
+    def test_tool_calls_not_in_upstream_messages(self, client, llm):
+        """
+        Turn 2: history includes a Turn-1 assistant message with tool_calls.
+        The upstream must NOT see tool_calls in that message — only XML in content.
+        """
+        captured = {}
+
+        async def capture_and_respond(messages=None, **kwargs):
+            captured["messages"] = messages
+            return llm_response(
+                "<attempt_completion><result>Done.</result></attempt_completion>"
+            )
+
+        llm.side_effect = capture_and_respond
+
+        # Simulate a Turn-2 request: Roo Code sends the Turn-1 assistant tool_call
+        # in history, followed by the tool result, and a new user message.
+        turn1_tc_id = "call_abc123"
+        turn1_assistant = _assistant_tool_call_msg([{
+            "id": turn1_tc_id,
+            "type": "function",
+            "function": {
+                "name": "write_to_file",
+                "arguments": json.dumps({"path": "foo.py", "content": "x = 1"}),
+            },
+        }])
+        turn1_result = _tool_result_msg(turn1_tc_id, '{"path":"foo.py","operation":"created"}')
+
+        resp = client.post("/v1/chat/completions", json={
+            "model": "test-model",
+            "messages": [
+                SYSTEM_MSG,
+                user_msg("Write foo.py"),
+                turn1_assistant,
+                turn1_result,
+                user_msg("Now finish."),
+            ],
+            "tools": DEFAULT_TOOLS,
+        })
+
+        assert resp.status_code == 200
+        assert captured.get("messages"), "Upstream was never called"
+
+        for msg in captured["messages"]:
+            assert "tool_calls" not in msg, (
+                f"BUG: tool_calls key found in upstream message (role={msg.get('role')!r}).\n"
+                f"Upstream receives conflicting formats (XML in content + OpenAI tool_calls).\n"
+                f"Message keys: {list(msg.keys())}"
+            )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # YAML-like tool call format
 # ──────────────────────────────────────────────────────────────────────────────
 

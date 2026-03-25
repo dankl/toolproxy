@@ -78,6 +78,13 @@ _STATIC_PRIMING_SEQUENCES: Dict[str, List[List[Dict]]] = {
             {"role": "user", "content": "[Tool Result]\n1. Buy milk\n2. Buy eggs"},
             {"role": "assistant", "content": "<write_to_file>\n<path>notes.md</path>\n<content>1. Buy milk\n2. Buy eggs\n3. Call dentist\n4. Water plants\n5. Fix bike</content>\n</write_to_file>"},
         ],
+        # Two-turn: truncated file — write directly, NEVER simulate [Tool Result]
+        [
+            {"role": "user", "content": "Rewrite the TaskForm component to add validation."},
+            {"role": "assistant", "content": "<read_file>\n<path>frontend/src/components/TaskForm.tsx</path>\n</read_file>"},
+            {"role": "user", "content": "[Tool Result]\nFile: frontend/src/components/TaskForm.tsx\n1 | import { useState } from 'react';\n2 | import { createTask } from '../services/api';\n[content truncated — 280 lines]"},
+            {"role": "assistant", "content": "<write_to_file>\n<path>frontend/src/components/TaskForm.tsx</path>\n<content>import { useState } from 'react';\nimport { createTask } from '../services/api';\n\nexport default function TaskForm({ onTaskCreated }: { onTaskCreated: () => void }) {\n  const [title, setTitle] = useState('');\n\n  const handleSubmit = async (e: React.FormEvent) => {\n    e.preventDefault();\n    if (!title.trim()) return;\n    await createTask({ title });\n    setTitle('');\n    onTaskCreated();\n  };\n\n  return (\n    <form onSubmit={handleSubmit}>\n      <input value={title} onChange={e => setTitle(e.target.value)} required />\n      <button type=\"submit\">Add</button>\n    </form>\n  );\n}\n</content>\n</write_to_file>"},
+        ],
     ],
     ClientType.CLINE.value: [
         # replace_in_file with SEARCH/REPLACE block format

@@ -13,6 +13,7 @@ import hashlib
 import json
 import logging
 import re
+import secrets
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -106,13 +107,11 @@ def parse_xml_to_arguments(
     Returns:
         Tuple of (arguments dict, tool_id if present, reasoning_content if present)
     """
-    # Try to parse as XML
-    try:
-        root = ET.fromstring(xml_string)
-    except ET.ParseError:
-        # Try to fix common issues
-        fixed_xml = fix_xml_string(xml_string)
-        root = ET.fromstring(fixed_xml)
+    # Always run fix_xml_string first to escape raw-text tags (content, diff, result)
+    # before ET parsing — this prevents JSX/HTML inside <content> from being
+    # misinterpreted as XML child elements even when the raw XML is technically valid.
+    fixed_xml = fix_xml_string(xml_string)
+    root = ET.fromstring(fixed_xml)
 
     # Verify root tag matches expected tool name
     if root.tag.lower() != expected_tool_name.lower():
@@ -189,11 +188,21 @@ def fix_xml_string(xml_string: str) -> str:
             inner = inner.replace('<', '&lt;').replace('>', '&gt;')
         return f'<{tag}>{inner}</{tag}>'
 
+    # Insert missing </diff> BEFORE escaping so the escape regex can match the full <diff> block
+    fixed = xml_string
+    if re.search(r'<diff\b', fixed, re.IGNORECASE) and not re.search(r'</diff>', fixed, re.IGNORECASE):
+        fixed = re.sub(
+            r'</(apply_diff|replace_in_file)>',
+            r'</diff>\n</\1>',
+            fixed,
+            flags=re.IGNORECASE,
+        )
+
     tag_pat = '|'.join(_RAW_TEXT_TAGS)
     fixed = re.sub(
         rf'<({tag_pat})>([\s\S]*?)</\1>',
         escape_raw_content,
-        xml_string,
+        fixed,
         flags=re.IGNORECASE,
     )
 
@@ -213,9 +222,14 @@ def fix_xml_string(xml_string: str) -> str:
 
 def generate_tool_id(xml_content: str) -> str:
     """
-    Generate a deterministic tool ID from XML content.
+    Generate a tool ID from XML content. The MD5 prefix is stable for
+    debugging, but a random suffix ensures uniqueness even when the model
+    repeats the exact same tool call (which would cause duplicate IDs and
+    confuse clients like Roo Code).
     """
-    return f"call_{hashlib.md5(xml_content.encode()).hexdigest()[:12]}"
+    base = hashlib.md5(xml_content.encode()).hexdigest()[:12]
+    suffix = secrets.token_hex(2)
+    return f"call_{base}_{suffix}"
 
 
 def convert_xml_tool_calls_to_openai_format(

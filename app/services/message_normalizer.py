@@ -66,6 +66,21 @@ def normalize_messages(
         content = msg.get("content")
 
         if isinstance(content, list):
+            # If an assistant message mixes text and tool_use blocks, drop the text.
+            # The proxy rule is "one tool call, nothing else". Text alongside tool_use
+            # is always hallucinated content (e.g. "[Awaiting tool result]...") that
+            # pollutes history and causes the model to keep confabulating.
+            if msg.get("role") == "assistant":
+                has_tool_use = any(
+                    isinstance(item, dict) and item.get("type") == "tool_use"
+                    for item in content
+                )
+                if has_tool_use:
+                    content = [
+                        item for item in content
+                        if not (isinstance(item, dict) and item.get("type") == "text")
+                    ]
+
             parts = []
             for item in content:
                 if not isinstance(item, dict):
@@ -110,6 +125,10 @@ def normalize_messages(
                 args = tc.get("function", {}).get("arguments", "{}")
                 xml_parts.append(_tool_call_to_xml(name, args))
             msg["content"] = "\n".join(xml_parts)
+            # Remove tool_calls so the upstream only sees XML in content —
+            # not both XML and native tool_calls, which confuses models without
+            # native function-call support.
+            msg.pop("tool_calls", None)
             logger.debug(f"[{request_id}] Normalised {len(tool_calls)} tool_calls → XML")
 
         normalized.append(msg)
