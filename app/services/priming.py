@@ -79,11 +79,54 @@ _STATIC_PRIMING_SEQUENCES: Dict[str, List[List[Dict]]] = {
             {"role": "assistant", "content": "<write_to_file>\n<path>notes.md</path>\n<content>1. Buy milk\n2. Buy eggs\n3. Call dentist\n4. Water plants\n5. Fix bike</content>\n</write_to_file>"},
         ],
         # Two-turn: truncated file — write directly, NEVER simulate [Tool Result]
+        # Uses the exact Roo Code truncation format so the model recognises it.
         [
-            {"role": "user", "content": "Rewrite the TaskForm component to add validation."},
-            {"role": "assistant", "content": "<read_file>\n<path>frontend/src/components/TaskForm.tsx</path>\n</read_file>"},
-            {"role": "user", "content": "[Tool Result]\nFile: frontend/src/components/TaskForm.tsx\n1 | import { useState } from 'react';\n2 | import { createTask } from '../services/api';\n[content truncated — 280 lines]"},
-            {"role": "assistant", "content": "<write_to_file>\n<path>frontend/src/components/TaskForm.tsx</path>\n<content>import { useState } from 'react';\nimport { createTask } from '../services/api';\n\nexport default function TaskForm({ onTaskCreated }: { onTaskCreated: () => void }) {\n  const [title, setTitle] = useState('');\n\n  const handleSubmit = async (e: React.FormEvent) => {\n    e.preventDefault();\n    if (!title.trim()) return;\n    await createTask({ title });\n    setTitle('');\n    onTaskCreated();\n  };\n\n  return (\n    <form onSubmit={handleSubmit}>\n      <input value={title} onChange={e => setTitle(e.target.value)} required />\n      <button type=\"submit\">Add</button>\n    </form>\n  );\n}\n</content>\n</write_to_file>"},
+            {"role": "user", "content": "Fix the pom.xml to include the missing test dependency."},
+            {"role": "assistant", "content": "<read_file>\n<path>taskmanager/backend/pom.xml</path>\n</read_file>"},
+            {
+                "role": "user",
+                "content": (
+                    "[Tool Result]\n"
+                    "File: taskmanager/backend/pom.xml\n"
+                    "IMPORTANT: File content truncated.\n"
+                    "Status: Showing lines 1-40 of 83 total lines.\n"
+                    "To read more: Use the read_file tool with offset=41 and limit=30.\n"
+                    "\n"
+                    " 1 | <?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                    " 2 | <project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n"
+                    " 3 |   <modelVersion>4.0.0</modelVersion>\n"
+                    " 4 |   <groupId>com.example</groupId>\n"
+                    " 5 |   <artifactId>taskmanager</artifactId>\n"
+                    " 6 |   <dependencies>"
+                ),
+            },
+            {
+                "role": "assistant",
+                "content": (
+                    "<write_to_file>\n"
+                    "<path>taskmanager/backend/pom.xml</path>\n"
+                    "<content><?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                    "<project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n"
+                    "  <modelVersion>4.0.0</modelVersion>\n"
+                    "  <groupId>com.example</groupId>\n"
+                    "  <artifactId>taskmanager</artifactId>\n"
+                    "  <version>0.0.1-SNAPSHOT</version>\n"
+                    "  <dependencies>\n"
+                    "    <dependency>\n"
+                    "      <groupId>org.springframework.boot</groupId>\n"
+                    "      <artifactId>spring-boot-starter-web</artifactId>\n"
+                    "    </dependency>\n"
+                    "    <dependency>\n"
+                    "      <groupId>org.springframework.boot</groupId>\n"
+                    "      <artifactId>spring-boot-starter-test</artifactId>\n"
+                    "      <scope>test</scope>\n"
+                    "    </dependency>\n"
+                    "  </dependencies>\n"
+                    "</project>\n"
+                    "</content>\n"
+                    "</write_to_file>"
+                ),
+            },
         ],
     ],
     ClientType.CLINE.value: [

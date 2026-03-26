@@ -22,6 +22,7 @@ from tests.live.conftest import (
     ROO_CODE_TOOLS,
     TOOL_WRITE_TO_FILE,
     TOOL_READ_FILE,
+    TOOL_APPLY_DIFF,
     TOOL_ATTEMPT_COMPLETION,
     TOOL_EXECUTE_COMMAND,
     TOOL_ASK_FOLLOWUP_QUESTION,
@@ -303,3 +304,302 @@ class TestTimeoutBehavior:
         assert resp["choices"][0]["message"].get("tool_calls") or \
                resp["choices"][0]["message"].get("content"), \
                "Expected a non-empty response from live upstream"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.6.4 — Truncation hallucination fix (Fix A + B + C)
+#
+# When the last user message contains Roo Code's exact truncation format
+# ("IMPORTANT: File content truncated. / To read more: Use the read_file
+# tool with offset=..."), the model must NOT respond with plain text that
+# contains "[Tool Result]" blocks. It must call a real tool:
+#   - read_file with offset= (to page through the file)
+#   - write_to_file (to write corrected content directly)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_TRUNCATED_POM_RESULT = (
+    "[Tool Result]\n"
+    "File: taskmanager/backend/pom.xml\n"
+    "IMPORTANT: File content truncated.\n"
+    "Status: Showing lines 1-40 of 83 total lines.\n"
+    "To read more: Use the read_file tool with offset=41 and limit=30.\n"
+    "\n"
+    " 1 | <?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+    " 2 | <project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n"
+    " 3 |   <modelVersion>4.0.0</modelVersion>\n"
+    " 4 |   <groupId>com.example</groupId>\n"
+    " 5 |   <artifactId>taskmanager</artifactId>\n"
+    " 6 |   <version>0.0.1-SNAPSHOT</version>\n"
+    " 7 |   <dependencies>\n"
+    " 8 |     <dependency>\n"
+    " 9 |       <groupId>org.springframework.boot</groupId>\n"
+    "10 |       <artifactId>spring-boot-starter-web</artifactId>\n"
+    "11 |     </dependency>\n"
+)
+
+
+class TestTruncationHallucination:
+    """
+    Live E2E tests verifying that the model does not hallucinate [Tool Result]
+    blocks when it encounters Roo Code's file-truncation notice.
+
+    Covers Fix A (priming format), Fix B (FORBIDDEN FORMATS), Fix C (dynamic reminder).
+    """
+
+    def _truncated_multiturn(self, client, extra_system: str = ""):
+        """
+        Build a conversation where the assistant read pom.xml and received a
+        truncated result. Submit this as the next turn to toolproxy.
+        The model must respond with a tool call — not hallucinated text.
+        """
+        system_content = (
+            "You are a Java/Spring Boot coding assistant. "
+            "Fix build issues by correcting pom.xml when needed. "
+            + extra_system
+        )
+        messages = [
+            {"role": "system", "content": system_content},
+            user_msg("Fix the pom.xml to include the missing spring-boot-starter-test dependency."),
+            _assistant_tool_call(
+                "read_file",
+                {"path": "taskmanager/backend/pom.xml"},
+                call_id="call_read_pom_01",
+            ),
+            _tool_result(_TRUNCATED_POM_RESULT, call_id="call_read_pom_01"),
+        ]
+        import os
+        model = os.environ.get("LIVE_MODEL", "openai/gpt-oss-120b")
+        resp = client.post("/v1/chat/completions", json={
+            "model": model,
+            "messages": messages,
+            "tools": ROO_CODE_TOOLS,
+        })
+        assert resp.status_code == 200, resp.text
+        return resp.json()
+
+    def test_truncated_file_produces_tool_call_not_hallucinated_text(self, live):
+        """
+        After seeing a truncated read_file result, the model must respond with
+        a real tool call — NOT a text response containing '[Tool Result]'.
+
+        Accepted tool calls:
+          - read_file with offset= (model is paging through the file)
+          - write_to_file          (model writes corrected content directly)
+          - apply_diff             (model patches the visible portion)
+
+        FAILS if model responds with plain text containing '[Tool Result]'.
+        """
+        resp = self._truncated_multiturn(live)
+        msg = resp["choices"][0]["message"]
+        tool_calls = msg.get("tool_calls") or []
+        content = msg.get("content") or ""
+
+        # The response must be a tool call, not plain text
+        assert tool_calls, (
+            "Model responded with plain text instead of a tool call after seeing "
+            "a truncated read_file result.\n"
+            f"Content preview: {content[:400]!r}\n"
+            "Expected: read_file(offset=) or write_to_file."
+        )
+
+        # And the text must NOT contain hallucinated [Tool Result] blocks
+        assert "[Tool Result]" not in content, (
+            f"Model hallucinated '[Tool Result]' in its own response.\n"
+            f"Content: {content[:400]!r}\n"
+            "Fix A/B/C must prevent this."
+        )
+
+    def test_model_uses_offset_or_writes_directly(self, live):
+        """
+        When faced with truncated pom.xml, the model must either:
+          - Page through it with read_file(offset=...)
+          - Write the corrected pom.xml directly with write_to_file
+
+        Calling read_file on the same path WITHOUT offset is a no-op loop — not acceptable.
+        """
+        resp = self._truncated_multiturn(live)
+        msg = resp["choices"][0]["message"]
+        tool_calls = msg.get("tool_calls") or []
+
+        if not tool_calls:
+            pytest.skip("No tool call in response — covered by test_truncated_file_produces_tool_call")
+
+        name, args = parse_tool_call(resp)
+        allowed = {"read_file", "write_to_file", "apply_diff", "attempt_completion"}
+        assert name in allowed, (
+            f"Unexpected tool call {name!r} after truncated file. Expected one of {allowed}."
+        )
+
+        if name == "read_file":
+            # If the model re-reads, it must use offset= to make progress
+            path = args.get("path", "")
+            offset = args.get("offset") or args.get("start_line")
+            assert offset or "pom" not in path, (
+                f"Model called read_file on {path!r} without offset= — this is a no-op loop.\n"
+                "After a truncation notice the model must use offset= to page forward."
+            )
+
+    def test_reminder_injection_does_not_break_normal_flow(self, live):
+        """
+        When the last tool result is NOT truncated, the truncation reminder must
+        NOT be injected and the model must behave normally.
+        """
+        messages = [
+            SYSTEM_MSG,
+            user_msg("Read the file README.md and tell me what it's about."),
+            _assistant_tool_call("read_file", {"path": "README.md"}, call_id="call_readme"),
+            _tool_result(
+                "[Tool Result]\nFile: README.md\n1 | # Task Manager\n2 | A simple Spring Boot app.",
+                call_id="call_readme",
+            ),
+        ]
+        import os
+        model = os.environ.get("LIVE_MODEL", "openai/gpt-oss-120b")
+        resp = client_obj = live.post("/v1/chat/completions", json={
+            "model": model,
+            "messages": messages,
+            "tools": ROO_CODE_TOOLS,
+        })
+        assert resp.status_code == 200, resp.text
+        result = resp.json()
+        # Any valid tool call or text is acceptable — we just verify no 500 / no crash
+        msg = result["choices"][0]["message"]
+        assert msg.get("tool_calls") or msg.get("content"), (
+            "Expected a non-empty response for non-truncated normal flow."
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.6.5 — apply_diff loop: correct hint fires (detect_repetitive before success)
+#
+# When the model calls apply_diff on the same file 3 times in a row, the hint
+# must say "not making progress, try a different approach" — NOT "already
+# succeeded, call attempt_completion" (which the model correctly ignores because
+# the task is still broken).
+# ─────────────────────────────────────────────────────────────────────────────
+
+_APPLY_DIFF_SUCCESS_RESULT = (
+    '{"path":"taskmanager/backend/src/main/java/com/example/taskmanager/controller/TaskController.java",'
+    '"operation":"modified","notice":"You do not need to re-read the file."}'
+)
+_APPLY_DIFF_FILE_PATH = (
+    "taskmanager/backend/src/main/java/com/example/taskmanager/controller/TaskController.java"
+)
+_APPLY_DIFF_DIFF = (
+    "<<<<<<< SEARCH\n:start_line:66\n-------\n    }\n=======\n>>>>>>> REPLACE"
+)
+
+
+class TestApplyDiffLoop:
+    """
+    Live E2E tests for the apply_diff loop fix (v1.6.5).
+
+    When the model has called apply_diff on the same file 3x in a row and the
+    task is still not complete (compile error persists), toolproxy must inject
+    the 'not making progress' hint so the model switches to write_to_file.
+    """
+
+    def _build_history(self, repeats: int) -> list:
+        """Build a normalized multi-turn history with N consecutive apply_diff calls."""
+        msgs = [
+            SYSTEM_MSG,
+            user_msg(
+                "Fix the compilation error in TaskController.java. "
+                "The file has an extra closing brace at line 66 that causes "
+                "'implicitly declared classes are not supported'."
+            ),
+            _assistant_tool_call(
+                "read_file", {"path": _APPLY_DIFF_FILE_PATH}, call_id="call_read_01"
+            ),
+            _tool_result(
+                "File: " + _APPLY_DIFF_FILE_PATH + "\n"
+                " 1 | package com.example.taskmanager.controller;\n"
+                "...\n"
+                "65 |     }\n"
+                "66 |     }  <- extra closing brace\n"
+                "67 | \n"
+                "68 |     @DeleteMapping(\"/{id}\")\n"
+                "...\n"
+                "78 | }",
+                call_id="call_read_01",
+            ),
+        ]
+        for i in range(repeats):
+            call_id = f"call_apply_{i:02d}"
+            msgs.append(
+                _assistant_tool_call(
+                    "apply_diff",
+                    {"path": _APPLY_DIFF_FILE_PATH, "diff": _APPLY_DIFF_DIFF},
+                    call_id=call_id,
+                )
+            )
+            msgs.append(
+                _tool_result(
+                    _APPLY_DIFF_SUCCESS_RESULT
+                    + "\n<notice>Making multiple related changes in a single apply_diff "
+                    "is more efficient.</notice>",
+                    call_id=call_id,
+                )
+            )
+        return msgs
+
+    def test_after_three_apply_diffs_model_switches_approach(self, live):
+        """
+        After 3 consecutive apply_diff calls that report 'modified' but have NOT
+        fixed the compilation, toolproxy must inject a hint that causes the model
+        to switch to write_to_file (or at least not repeat the same apply_diff).
+
+        Verifies that detect_repetitive_tool_loop fires first with the correct
+        'not making progress, try a different approach' hint.
+        """
+        import os
+        msgs = self._build_history(repeats=3)
+        msgs.append(user_msg(
+            "The compilation still fails: "
+            "'implicitly declared classes are not supported'. "
+            "The extra brace is still there. Fix it."
+        ))
+        model = os.environ.get("LIVE_MODEL", "openai/gpt-oss-120b")
+        resp = live.post("/v1/chat/completions", json={
+            "model": model,
+            "messages": msgs,
+            "tools": [TOOL_READ_FILE, TOOL_WRITE_TO_FILE, TOOL_APPLY_DIFF, TOOL_ATTEMPT_COMPLETION],
+        })
+        assert resp.status_code == 200, resp.text
+        name, args = parse_tool_call(resp.json())
+
+        # Model must NOT keep calling apply_diff with the same broken diff
+        if name == "apply_diff":
+            assert args.get("diff") != _APPLY_DIFF_DIFF, (
+                "Model repeated the same apply_diff that failed 3 times.\n"
+                "The 'not making progress' hint from detect_repetitive_tool_loop "
+                "should have prompted a different approach."
+            )
+
+    def test_after_two_apply_diffs_hint_guides_to_verify_not_complete(self, live):
+        """
+        After 2 apply_diffs the success_loop hint fires. It must now suggest
+        read_file or write_to_file — NOT just 'call attempt_completion'.
+
+        Verifies the updated success_loop hint (v1.6.5).
+        """
+        import os
+        msgs = self._build_history(repeats=2)
+        msgs.append(user_msg(
+            "The compilation still fails. The brace is still there. Please fix it."
+        ))
+        model = os.environ.get("LIVE_MODEL", "openai/gpt-oss-120b")
+        resp = live.post("/v1/chat/completions", json={
+            "model": model,
+            "messages": msgs,
+            "tools": [TOOL_READ_FILE, TOOL_WRITE_TO_FILE, TOOL_APPLY_DIFF, TOOL_ATTEMPT_COMPLETION],
+        })
+        assert resp.status_code == 200, resp.text
+        name, _ = parse_tool_call(resp.json())
+
+        # Model must not prematurely call attempt_completion when task is not done
+        assert name != "attempt_completion", (
+            "Model called attempt_completion even though compilation still fails.\n"
+            "The success_loop hint must not say 'call attempt_completion' — "
+            "it should suggest read_file or write_to_file instead."
+        )

@@ -462,7 +462,7 @@ class TestToolResultHallucinationPrevention:
         found_truncated_user = False
         found_write_after_truncation = False
         for i, msg in enumerate(messages):
-            if msg.get("role") == "user" and "truncated" in msg.get("content", ""):
+            if msg.get("role") == "user" and "truncated" in msg.get("content", "").lower():
                 found_truncated_user = True
                 # Next assistant message must be a write_to_file
                 if i + 1 < len(messages):
@@ -477,3 +477,478 @@ class TestToolResultHallucinationPrevention:
             "After a truncated [Tool Result] the priming must show write_to_file as response.\n"
             "Without this the model may hallucinate [Tool Result] blocks instead."
         )
+
+    def test_priming_uses_exact_roo_code_truncation_format(self):
+        """
+        Priming truncated-file example must use the exact Roo Code format:
+          'IMPORTANT: File content truncated.'
+          'To read more: Use the read_file tool with offset=...'
+
+        FAILS if priming still uses old '[content truncated — N lines]' placeholder.
+        PASSES after fix A (priming.py): example updated to real Roo Code format.
+        """
+        messages = self._get_priming_messages()
+        roo_format_found = any(
+            "IMPORTANT: File content truncated" in msg.get("content", "")
+            for msg in messages
+            if msg.get("role") == "user"
+        )
+        assert roo_format_found, (
+            "Priming must use the exact Roo Code truncation format "
+            "('IMPORTANT: File content truncated.') — not a placeholder like "
+            "'[content truncated — N lines]'. "
+            "Without the exact format the model does not recognize the pattern."
+        )
+
+    def test_forbidden_formats_mentions_offset_option(self):
+        """
+        FORBIDDEN FORMATS must clarify that read_file with offset= IS allowed —
+        only [Tool Result] hallucination is forbidden.
+
+        FAILS if the rule only says 'write_to_file directly' without mentioning offset.
+        PASSES after fix B (xml_prompt_builder.py).
+        """
+        prompt = self._get_system_prompt()
+        assert "offset" in prompt, (
+            "FORBIDDEN FORMATS must mention that read_file with offset= is allowed "
+            "when a file is truncated. Without this the model avoids paging through "
+            "large files and may hallucinate instead."
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BUG: _inject_truncation_reminder (Fix C — dynamic reminder injection)
+# File: app/main.py
+#
+# When the last user message contains Roo Code's truncation notice
+# ("IMPORTANT: File content truncated"), toolproxy must append a reminder
+# so the model does not hallucinate [Tool Result] blocks.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestInjectTruncationReminder:
+
+    _ROO_TRUNCATION = (
+        "[Tool Result]\n"
+        "File: taskmanager/backend/pom.xml\n"
+        "IMPORTANT: File content truncated.\n"
+        "Status: Showing lines 1-40 of 83 total lines.\n"
+        "To read more: Use the read_file tool with offset=41 and limit=30.\n"
+        "\n"
+        " 1 | <?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+    )
+
+    def _call(self, messages):
+        from app.main import _inject_truncation_reminder
+        return _inject_truncation_reminder(messages, request_id="test")
+
+    def test_reminder_injected_when_last_user_message_is_truncated(self):
+        """
+        Reminder must be appended to the last user message when it contains
+        the Roo Code truncation marker.
+
+        FAILS before fix C: function does not exist yet.
+        PASSES after fix C: reminder appended.
+        """
+        messages = [
+            {"role": "system", "content": "You are a coding assistant."},
+            {"role": "user", "content": self._ROO_TRUNCATION},
+        ]
+        result = self._call(messages)
+        last_user = next(m for m in reversed(result) if m.get("role") == "user")
+        assert "REMINDER" in last_user["content"], (
+            "_inject_truncation_reminder must append a [REMINDER] to the last user "
+            "message when it contains 'IMPORTANT: File content truncated'."
+        )
+        assert "offset" in last_user["content"], (
+            "The reminder must mention that read_file with offset= is allowed."
+        )
+        assert "[Tool Result]" in last_user["content"] or "Tool Result" in last_user["content"], (
+            "The reminder must warn about [Tool Result] hallucination."
+        )
+
+    def test_reminder_not_injected_for_normal_content(self):
+        """
+        Reminder must NOT fire when the last user message is normal content.
+        """
+        messages = [
+            {"role": "system", "content": "You are a coding assistant."},
+            {"role": "user", "content": "[Tool Result]\nFile: hello.py\n1 | print('hello')"},
+        ]
+        result = self._call(messages)
+        last_user = next(m for m in reversed(result) if m.get("role") == "user")
+        # Content must be unchanged (no reminder injected)
+        assert last_user["content"] == messages[-1]["content"], (
+            "Reminder must not be injected when the tool result is not truncated."
+        )
+
+    def test_reminder_not_injected_when_truncation_is_not_in_last_message(self):
+        """
+        Truncation in an EARLIER message must not trigger the reminder.
+        Only the last user message matters.
+        """
+        messages = [
+            {"role": "system", "content": "You are a coding assistant."},
+            {"role": "user", "content": self._ROO_TRUNCATION},          # earlier — truncated
+            {"role": "assistant", "content": "<read_file><path>pom.xml</path></read_file>"},
+            {"role": "user", "content": "[Tool Result]\n 1 | <?xml ..."},  # last — NOT truncated
+        ]
+        result = self._call(messages)
+        last_user = next(m for m in reversed(result) if m.get("role") == "user")
+        assert "REMINDER" not in last_user["content"], (
+            "Reminder must only fire when the LAST user message is truncated, "
+            "not when a previous message was truncated."
+        )
+
+    def test_messages_list_not_mutated_in_place(self):
+        """_inject_truncation_reminder must return a new list, not mutate the original."""
+        original_content = self._ROO_TRUNCATION
+        messages = [{"role": "user", "content": original_content}]
+        result = self._call(messages)
+        # Original list must be unchanged
+        assert messages[0]["content"] == original_content, (
+            "_inject_truncation_reminder mutated the original messages list."
+        )
+        # Result must be a different list
+        assert result is not messages, "Must return a new list, not the original."
+
+    def test_list_content_type_handled(self):
+        """
+        Roo Code sometimes sends content as a list of content blocks (not a plain string).
+        The reminder must still be appended correctly.
+        """
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "content": self._ROO_TRUNCATION},
+                    {"type": "text", "text": "environment_details here"},
+                ],
+            }
+        ]
+        result = self._call(messages)
+        last_user = next(m for m in reversed(result) if m.get("role") == "user")
+        # When content is a list, reminder is appended as a new text block
+        content = last_user["content"]
+        assert isinstance(content, list), "List content must stay a list"
+        texts = " ".join(
+            part.get("text", "") for part in content if isinstance(part, dict)
+        )
+        assert "REMINDER" in texts, (
+            "Reminder must be appended as a text block when content is a list."
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BUG: apply_diff loop — wrong hint because detect_success_loop fires before
+# detect_repetitive_tool_loop (v1.6.5)
+# File: app/main.py, app/services/loop_detection.py
+#
+# When the model calls apply_diff on the same file 3+ times in a row, the
+# detect_success_loop fires first (threshold=2, because "modified" appears in
+# every apply_diff result) with the hint "already succeeded, call
+# attempt_completion". The model CORRECTLY ignores this hint because the
+# compilation is still broken — the task is NOT done. detect_repetitive_tool_loop
+# would give the right hint ("not making progress, try a different approach")
+# but is never reached due to short-circuit evaluation.
+#
+# Fix 1 (main.py): run detect_repetitive_tool_loop BEFORE detect_success_loop.
+# Fix 2 (loop_detection.py): update success_loop hint to not say
+#   "call attempt_completion" but "verify with read_file or write_to_file".
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestApplyDiffLoopHint:
+    """
+    Verify that an apply_diff loop on the same file gets the correct
+    'not making progress' hint, not the misleading 'already succeeded' hint.
+    """
+
+    _APPLY_DIFF_RESULT = (
+        '{"path":"taskmanager/backend/src/main/java/com/example/taskmanager/controller/TaskController.java",'
+        '"operation":"modified","notice":"Proceed with the task."}'
+    )
+
+    def _build_apply_diff_history(self, repeats: int) -> list:
+        """Build a normalized message history with N consecutive apply_diff calls."""
+        file_path = "taskmanager/backend/src/main/java/com/example/taskmanager/controller/TaskController.java"
+        diff_content = "<<<<<<< SEARCH\n:start_line:66\n-------\n    }\n=======\n>>>>>>> REPLACE"
+        msgs = [
+            {"role": "system", "content": "You are a coding assistant."},
+            {"role": "user", "content": "Fix the extra closing brace in TaskController.java."},
+        ]
+        for i in range(repeats):
+            msgs.append({
+                "role": "assistant",
+                "content": (
+                    f"<apply_diff>\n"
+                    f"<path>{file_path}</path>\n"
+                    f"<diff>{diff_content}</diff>\n"
+                    f"</apply_diff>"
+                ),
+            })
+            msgs.append({
+                "role": "user",
+                "content": f"[Tool Result]\n{self._APPLY_DIFF_RESULT}",
+            })
+        return msgs
+
+    def test_repetitive_hint_fires_before_success_hint_for_apply_diff(self):
+        """
+        After 3 consecutive apply_diff calls on the same file, the hint must come
+        from detect_repetitive_tool_loop ('not making progress') NOT from
+        detect_success_loop ('already succeeded, call attempt_completion').
+
+        FAILS before fix: detect_success_loop fires first (threshold=2) with the
+          wrong hint; detect_repetitive_tool_loop is never reached.
+        PASSES after fix: detect_repetitive_tool_loop runs first → correct hint.
+        """
+        from app.services.loop_detection import detect_repetitive_tool_loop, detect_success_loop
+        from app.services.tool_mapping import ClientType
+
+        msgs = self._build_apply_diff_history(repeats=3)
+        repetitive_hint = detect_repetitive_tool_loop(msgs, "test", ClientType.ROO_CODE)
+        success_hint = detect_success_loop(msgs, "test", ClientType.ROO_CODE)
+
+        # Both detectors should fire
+        assert repetitive_hint is not None, (
+            "detect_repetitive_tool_loop must fire after 3 consecutive apply_diff calls."
+        )
+        assert success_hint is not None, (
+            "detect_success_loop fires too (because 'modified' is in results) — "
+            "but it must NOT be the one used."
+        )
+
+        # The hint actually used by main.py must be the repetitive one (fires first now)
+        loop_hint = repetitive_hint or success_hint
+        assert loop_hint is repetitive_hint, (
+            "With the new order (repetitive first), the repetitive hint must win.\n"
+            f"Got: {loop_hint!r}\n"
+            f"Expected: {repetitive_hint!r}"
+        )
+        assert "attempt_completion" not in loop_hint, (
+            "The hint injected for an apply_diff loop must NOT say 'call attempt_completion'.\n"
+            "The task is not done — compilation still fails. The model correctly ignores\n"
+            f"that hint. Got: {loop_hint!r}"
+        )
+        assert "different approach" in loop_hint or "write_to_file" in loop_hint.lower(), (
+            f"The hint must suggest a different approach (write_to_file). Got: {loop_hint!r}"
+        )
+
+    def test_success_loop_hint_no_longer_says_call_attempt_completion(self):
+        """
+        The success_loop hint must NOT say 'call attempt_completion' any more.
+        It should instead suggest read_file / write_to_file for verification.
+
+        FAILS before fix: hint ends with 'Call attempt_completion...'
+        PASSES after fix: hint says 'use read_file to verify or write_to_file'
+        """
+        from app.services.loop_detection import detect_success_loop
+        from app.services.tool_mapping import ClientType
+
+        msgs = self._build_apply_diff_history(repeats=2)
+        hint = detect_success_loop(msgs, "test", ClientType.ROO_CODE)
+        assert hint is not None, "detect_success_loop must fire after 2 'modified' results."
+        assert "read_file" in hint, (
+            f"success_loop hint must mention read_file for verification. Got: {hint!r}"
+        )
+        assert "write_to_file" in hint, (
+            f"success_loop hint must mention write_to_file as alternative. Got: {hint!r}"
+        )
+
+    def test_repetitive_loop_does_not_fire_after_only_two_apply_diffs(self):
+        """
+        Repetitive loop threshold is 3. After only 2 apply_diffs, it must not fire.
+        (success_loop still fires at 2 — that is acceptable fallback behaviour.)
+        """
+        from app.services.loop_detection import detect_repetitive_tool_loop
+        from app.services.tool_mapping import ClientType
+
+        msgs = self._build_apply_diff_history(repeats=2)
+        hint = detect_repetitive_tool_loop(msgs, "test", ClientType.ROO_CODE)
+        assert hint is None, (
+            f"detect_repetitive_tool_loop must NOT fire after only 2 apply_diffs. "
+            f"Got: {hint!r}"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX v1.6.6: Generic truncation detection
+# File: app/main.py (_TRUNCATION_RE)
+#
+# Previously _TRUNCATION_MARKER only matched the exact string
+# "IMPORTANT: File content truncated". Roo Code also uses other formats:
+#   - "(Truncated)" at the end of a file read result
+#   - "file was truncated" in error messages
+#
+# Fix: replace string check with re.compile(r"\btruncated\b", re.IGNORECASE).
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestGenericTruncationDetection:
+
+    def _call(self, messages):
+        from app.main import _inject_truncation_reminder
+        return _inject_truncation_reminder(messages, request_id="test")
+
+    def test_reminder_fires_for_classic_important_format(self):
+        """Backward compat: original 'IMPORTANT: File content truncated' still fires."""
+        messages = [{"role": "user", "content": (
+            "[Tool Result]\nFile: foo.java\n"
+            "IMPORTANT: File content truncated.\n"
+            "1 | package com.example;"
+        )}]
+        result = self._call(messages)
+        last_user = next(m for m in reversed(result) if m["role"] == "user")
+        assert "REMINDER" in last_user["content"]
+
+    def test_reminder_fires_for_parenthesised_truncated(self):
+        """
+        Roo Code sometimes ends a file result with '(Truncated)' instead of the
+        IMPORTANT header. The regex must catch this format too.
+        """
+        messages = [{"role": "user", "content": (
+            "[Tool Result]\n"
+            "File: taskmanager/frontend/src/components/TaskList.tsx\n"
+            "1 | import React from 'react';\n"
+            "34 |     ... ... ... ... ... ... ... ... ... ...\n"
+            "(Truncated)"
+        )}]
+        result = self._call(messages)
+        last_user = next(m for m in reversed(result) if m["role"] == "user")
+        assert "REMINDER" in last_user["content"], (
+            "_inject_truncation_reminder must fire for '(Truncated)' format. "
+            "Regex \\btruncated\\b (IGNORECASE) should catch this."
+        )
+
+    def test_reminder_fires_case_insensitive(self):
+        """'truncated' in any casing must trigger the reminder."""
+        for variant in ["Truncated", "TRUNCATED", "truncated"]:
+            messages = [{"role": "user", "content": f"File content {variant}."}]
+            result = self._call(messages)
+            last_user = next(m for m in reversed(result) if m["role"] == "user")
+            assert "REMINDER" in last_user["content"], (
+                f"Reminder must fire for casing variant {variant!r}"
+            )
+
+    def test_reminder_not_fire_for_unrelated_word(self):
+        """'truncate' without word boundary (e.g. 'untruncated') must not match."""
+        messages = [{"role": "user", "content": "The file was not untruncated."}]
+        result = self._call(messages)
+        last_user = next(m for m in reversed(result) if m["role"] == "user")
+        assert "REMINDER" not in last_user["content"], (
+            "\\btruncated\\b must not match inside 'untruncated' — word boundary required."
+        )
+
+    def test_reminder_mentions_apply_diff_ban(self):
+        """
+        The reminder injected for a truncated file must explicitly say
+        'apply_diff' is not allowed. Without this, the model may try to patch
+        a file it has only partially read.
+        """
+        messages = [{"role": "user", "content": "(Truncated) file content here"}]
+        result = self._call(messages)
+        last_user = next(m for m in reversed(result) if m["role"] == "user")
+        assert "apply_diff" in last_user["content"], (
+            "Truncation reminder must explicitly ban apply_diff. "
+            "The model must not attempt a partial patch on a truncated file."
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX v1.6.7: validate_apply_diff_completeness
+# File: app/services/tool_call_fixups.py
+#
+# A corrupt or truncated apply_diff is missing the '>>>>>>> REPLACE' closing
+# marker. Passing it to Roo Code causes an apply failure. Dropping it is
+# safer than letting Roo Code receive garbage.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestValidateApplyDiffCompleteness:
+
+    def _make_tc(self, name: str, diff: str, path: str = "src/Foo.java") -> list:
+        return [{
+            "id": "call_test",
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": json.dumps({"path": path, "diff": diff}),
+            },
+        }]
+
+    _VALID_DIFF = (
+        "<<<<<<< SEARCH\n"
+        "    public void old() {}\n"
+        "=======\n"
+        "    public void new() {}\n"
+        ">>>>>>> REPLACE"
+    )
+
+    _CORRUPT_DIFF = (
+        "<<<<<<< SEARCH\n"
+        "    public void old() {}\n"
+        "=======\n"
+        "    public void new() {\n"
+        "        const newId?????????"  # truncated, no >>>>>>> REPLACE
+    )
+
+    def test_valid_apply_diff_passes_through(self):
+        """A complete apply_diff with >>>>>>> REPLACE must be returned unchanged."""
+        from app.services.tool_call_fixups import validate_apply_diff_completeness
+        tc = self._make_tc("apply_diff", self._VALID_DIFF)
+        result = validate_apply_diff_completeness(tc, "test")
+        assert len(result) == 1, "Valid apply_diff must not be dropped"
+        assert result[0]["function"]["name"] == "apply_diff"
+
+    def test_corrupt_apply_diff_is_dropped(self):
+        """
+        An apply_diff missing '>>>>>>> REPLACE' must be dropped entirely.
+
+        FAILS if validate_apply_diff_completeness does not exist or lets it through.
+        PASSES after fix: corrupt diffs are silently dropped.
+        """
+        from app.services.tool_call_fixups import validate_apply_diff_completeness
+        tc = self._make_tc("apply_diff", self._CORRUPT_DIFF)
+        result = validate_apply_diff_completeness(tc, "test")
+        assert len(result) == 0, (
+            "Corrupt apply_diff (missing >>>>>>> REPLACE) must be dropped. "
+            f"Got: {result}"
+        )
+
+    def test_corrupt_replace_in_file_is_dropped(self):
+        """replace_in_file (Cline) with corrupt diff must also be dropped."""
+        from app.services.tool_call_fixups import validate_apply_diff_completeness
+        tc = self._make_tc("replace_in_file", self._CORRUPT_DIFF)
+        result = validate_apply_diff_completeness(tc, "test")
+        assert len(result) == 0, (
+            "Corrupt replace_in_file (missing >>>>>>> REPLACE) must be dropped."
+        )
+
+    def test_valid_replace_in_file_passes_through(self):
+        """Complete replace_in_file must pass through unchanged."""
+        from app.services.tool_call_fixups import validate_apply_diff_completeness
+        tc = self._make_tc("replace_in_file", self._VALID_DIFF)
+        result = validate_apply_diff_completeness(tc, "test")
+        assert len(result) == 1
+
+    def test_other_tools_always_pass_through(self):
+        """Non-diff tools (write_to_file etc.) must never be filtered."""
+        from app.services.tool_call_fixups import validate_apply_diff_completeness
+        tc = [{
+            "id": "call_w",
+            "type": "function",
+            "function": {
+                "name": "write_to_file",
+                "arguments": json.dumps({"path": "foo.py", "content": "print('hi')"}),
+            },
+        }]
+        result = validate_apply_diff_completeness(tc, "test")
+        assert result == tc
+
+    def test_empty_diff_is_not_dropped(self):
+        """
+        An apply_diff with no diff argument at all (empty string / missing key)
+        must pass through — it may be a degenerate case handled elsewhere.
+        Only non-empty diffs missing >>>>>>> REPLACE are dropped.
+        """
+        from app.services.tool_call_fixups import validate_apply_diff_completeness
+        tc = self._make_tc("apply_diff", "")
+        result = validate_apply_diff_completeness(tc, "test")
+        assert len(result) == 1, "Empty diff must not be dropped (handled elsewhere)"

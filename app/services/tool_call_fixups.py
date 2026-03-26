@@ -259,6 +259,48 @@ def convert_new_file_diffs(
     return result
 
 
+_DIFF_TOOLS = {"apply_diff", "replace_in_file"}
+
+
+def validate_apply_diff_completeness(
+    tool_calls: List[Dict], request_id: str
+) -> List[Dict]:
+    """
+    Drop apply_diff / replace_in_file calls whose diff is missing the closing
+    '>>>>>>> REPLACE' marker.
+
+    A truncated or corrupt model output may produce a diff that starts a REPLACE
+    block but never closes it.  Passing such a diff to Roo Code causes an apply
+    failure.  Dropping the tool call lets the main flow fall through to the empty
+    fallback (attempt_completion) or text synthesis, which is less confusing for
+    the user than a silent patch failure.
+    """
+    result = []
+    for tc in tool_calls:
+        name = tc.get("function", {}).get("name", "")
+        if name not in _DIFF_TOOLS:
+            result.append(tc)
+            continue
+
+        try:
+            args = json.loads(tc["function"].get("arguments", "{}"))
+        except (json.JSONDecodeError, KeyError):
+            result.append(tc)
+            continue
+
+        diff = args.get("diff", "")
+        if diff and ">>>>>>> REPLACE" not in diff:
+            logger.warning(
+                f"[{request_id}] Dropping corrupt {name}: "
+                "diff is missing '>>>>>>> REPLACE' closing marker"
+            )
+            continue  # drop — do not append
+
+        result.append(tc)
+
+    return result
+
+
 def convert_move_file_to_execute_command(
     tool_calls: List[Dict], tool_names: List[str], request_id: str
 ) -> List[Dict]:

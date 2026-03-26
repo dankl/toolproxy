@@ -25,6 +25,8 @@ toolproxy :8007
   ├─ System-Prompt: XML-Tool-Definitionen ergänzen
   ├─ History normalisieren: tool_calls + role:tool → XML
   ├─ Priming injizieren (nur 1. Turn)
+  ├─ Loop-Detection: Repetitive-Loop → dann Success-Loop (CORRECTION-Hint)
+  ├─ Truncation-Reminder injizieren (wenn letztes Tool-Result truncated)
   ↓  Plain text request ohne tools[]
 Upstream LLM (OpenAI-kompatibler Endpoint)
   ↓  XML tool call in response (immer kanonische Namen)
@@ -250,7 +252,7 @@ python3 -m pytest -v
 python3 -m pytest -v tests/test_roundtrip.py::TestXmlToolCalls
 ```
 
-Aktuelle Test-Coverage: 94 Unit-Tests gesamt (ohne Live-Tests).
+Aktuelle Test-Coverage: 104 Unit-Tests gesamt (ohne Live-Tests).
 
 **Live E2E-Tests** (laufen gegen echtes Modell, kein Mock):
 ```bash
@@ -261,7 +263,7 @@ python3 -m pytest -m live -v
 TOOLPROXY_UPSTREAM_URL=http://localhost:8005/v1 python3 -m pytest -m live -v
 ```
 
-Live-Tests decken ab: Write Guard, Repetitive-Loop-Detection, Timeout-Verhalten, alle Roo-Code- und OpenCode-Tools.
+Live-Tests decken ab: Write Guard, Repetitive-Loop-Detection, Timeout-Verhalten, Truncation-Halluzination, apply_diff-Loop, alle Roo-Code- und OpenCode-Tools.
 
 ## Bekannte Modell-Eigenheiten & Proxy-Fixes
 
@@ -376,18 +378,18 @@ INFO  [abc12345] Text response → synthesizing attempt_completion fallback
 
 ### Loop-Detection (implementiert)
 
-Zwei Detektoren, die beide einen CORRECTION-Hint in die letzte User-Message injizieren:
+Zwei Detektoren, die einen CORRECTION-Hint in die letzte User-Message injizieren. **Reihenfolge:** Repetitive-Loop wird zuerst geprüft, Success-Loop als Fallback — so bekommt ein `apply_diff`-Loop die präzisere Hint ("not making progress, use write_to_file") statt der irreführenden ("already succeeded, call attempt_completion").
 
-**Success-Loop:** 2+ aufeinanderfolgende erfolgreiche Write-Operationen ohne echten User-Turn → das Modell schreibt Duplikate.
+**Repetitive-Loop** (Threshold 3): Dasselbe Tool mit demselben Pfad 3× in Folge → das Modell dreht sich im Kreis ohne Fortschritt. Hint: *"use write_to_file with complete content or read_file to verify"*.
 
-**Repetitive-Loop:** Dasselbe Tool mit demselben Pfad 3× in Folge (z.B. `read_file` auf dieselbe Datei) → das Modell dreht sich im Kreis ohne Fortschritt.
+**Success-Loop** (Threshold 2, Fallback): 2+ aufeinanderfolgende erfolgreiche Write-Operationen ohne echten User-Turn → das Modell schreibt Duplikate. Hint: *"operation reported success N times but task may not be complete — verify with read_file or write_to_file"*.
 
 Ein echter User-Turn (keine `[Tool Result]`-Nachricht) setzt beide Zähler zurück.
 
 Im Log sichtbar als:
 ```
+WARNING [abc12345] REPETITIVE LOOP: tool='apply_diff' called 3× in a row — injecting correction hint
 WARNING [abc12345] SUCCESS LOOP: 2 consecutive successful write operations — injecting stop hint
-WARNING [abc12345] REPETITIVE LOOP: tool='read_file' called 3× in a row — injecting correction hint
 ```
 
 ### Doppelte Tool-Call-IDs (implementiert)
@@ -416,11 +418,19 @@ Proxy fixes:   "follow_up": ["Show output", "Restart server", "Check config"]
 
 ### [Tool Result]-Halluzination bei gekürzten Dateien (implementiert)
 
-Roo Code kürzt große Dateien bei `read_file` (Ausgabe endet mit `...`). Das Modell interpretiert das als "Datei korrupt" und schreibt daraufhin `[Tool Result]`-Blöcke und Dateiinhalte direkt in seinen Response-Text — statt `write_to_file` aufzurufen. Die Dateien werden nie tatsächlich geschrieben; Roo Code bricht ab.
+Roo Code kürzt große Dateien bei `read_file` mit einem spezifischen Format:
+```
+IMPORTANT: File content truncated.
+Status: Showing lines 1-40 of 83 total lines.
+To read more: Use the read_file tool with offset=41 and limit=30.
+```
 
-Fix (zweistufig, defense-in-depth):
-1. **System-Prompt** (FORBIDDEN FORMATS): `[Tool Result]` ist explizit verboten — "NEVER write it yourself, call write_to_file directly"
-2. **Priming**: Neue 2-Turn Static Sequence zeigt das korrekte Verhalten: truncated file result → direkt `write_to_file` aufrufen, kein Fake-Output
+Das Modell kann dieses Format falsch interpretieren und `[Tool Result]`-Blöcke in seinen Response-Text schreiben statt ein echtes Tool aufzurufen. Roo Code bricht dann ab.
+
+Fix (dreistufig, defense-in-depth):
+1. **Priming** (Fix A): Static Sequence zeigt das exakte Roo Code-Truncation-Format und das korrekte Verhalten: truncated result → direkt `write_to_file` aufrufen
+2. **System-Prompt FORBIDDEN FORMATS** (Fix B): `[Tool Result]` explizit verboten; klärt außerdem dass `read_file` mit `offset=` erlaubt ist um weitere Seiten zu lesen
+3. **Dynamischer Truncation-Reminder** (Fix C, `_inject_truncation_reminder` in `main.py`): Wenn das letzte User-Message `"IMPORTANT: File content truncated"` enthält, wird ein `[REMINDER]` an die Nachricht angehängt bevor sie ans Modell geht — wirkt auch nach langen Konversationen wenn der Priming-Effekt nachlässt
 
 ### Write Guard (implementiert)
 

@@ -40,6 +40,7 @@ from app.services.tool_call_fixups import (
     fix_ask_followup_question_params,
     parse_json_fallback,
     rescue_xml_in_attempt_completion,
+    validate_apply_diff_completeness,
 )
 from app.services.tool_mapping import (
     ClientType,
@@ -61,7 +62,7 @@ from app.services.xml_parser import (
 from app.services.audit_log import extract_file_info, setup_audit_logger, write_audit
 from app.services.xml_prompt_builder import build_xml_system_prompt
 
-VERSION = "1.6.3"  # Priming + system prompt: prevent [Tool Result] hallucination on truncated files
+VERSION = "1.6.7"  # Truncation: reminder bans apply_diff; validate_apply_diff_completeness drops corrupt diffs
 
 # Chat-Template-Leak artifacts produced by gpt-oss models — strip these from preamble text
 # but preserve any legitimate reasoning the model outputs before the XML tool call.
@@ -72,6 +73,54 @@ _LEAK_PATTERN = re.compile(
     ,
     re.IGNORECASE,
 )
+
+_TRUNCATION_RE = re.compile(r"\btruncated\b", re.IGNORECASE)
+_TRUNCATION_REMINDER = (
+    "[REMINDER] The previous file read was truncated. "
+    "You MAY call read_file again with offset= to read the next page. "
+    "You MAY call write_to_file directly if you know the correct content. "
+    "NEVER call apply_diff on a truncated file — you do not have the full content. "
+    "NEVER write '[Tool Result]' anywhere in your response — that is SYSTEM output only."
+)
+
+
+def _inject_truncation_reminder(messages: List[Dict], request_id: str) -> List[Dict]:
+    """
+    If the last user message contains Roo Code's file-truncation notice, append a
+    reminder so the model doesn't hallucinate [Tool Result] blocks.
+    """
+    last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+    if last_user is None:
+        return messages
+
+    content = last_user.get("content") or ""
+    if isinstance(content, list):
+        # Scan all string values in content blocks (covers both "text" and "content" keys)
+        parts: List[str] = []
+        for part in content:
+            if isinstance(part, dict):
+                for v in part.values():
+                    if isinstance(v, str):
+                        parts.append(v)
+        content = " ".join(parts)
+
+    if not _TRUNCATION_RE.search(content):
+        return messages
+
+    logger.info(f"[{request_id}] Truncated file in last user message — injecting reminder")
+    result = list(messages)
+    for i in range(len(result) - 1, -1, -1):
+        if result[i].get("role") == "user":
+            result[i] = dict(result[i])
+            existing = result[i].get("content") or ""
+            if isinstance(existing, list):
+                existing = list(existing) + [{"type": "text", "text": _TRUNCATION_REMINDER}]
+                result[i]["content"] = existing
+            else:
+                result[i]["content"] = str(existing) + f"\n\n{_TRUNCATION_REMINDER}"
+            break
+    return result
+
 
 logging.basicConfig(
     level=getattr(logging, settings.log_level),
@@ -241,10 +290,15 @@ async def chat_completions(request: Dict[str, Any]):
     if canonical_tools:
         messages = inject_priming(messages, canonical_tools, client_type)
 
-    # 3b. Loop detection — append stop hint to last user message if model is looping
+    # 3b. Loop detection — append stop hint to last user message if model is looping.
+    # detect_repetitive_tool_loop runs FIRST: it fires at threshold=3 and gives a more
+    # accurate hint ("not making progress, try a different approach") for cases like
+    # apply_diff called on the same file 3× in a row.  detect_success_loop fires at
+    # threshold=2 with a broader hint; it acts as a fallback for write-type loops that
+    # don't yet reach the repetitive threshold.
     loop_hint = (
-        detect_success_loop(messages, request_id, client_type)
-        or detect_repetitive_tool_loop(messages, request_id, client_type)
+        detect_repetitive_tool_loop(messages, request_id, client_type)
+        or detect_success_loop(messages, request_id, client_type)
     )
     if loop_hint:
         for i in range(len(messages) - 1, -1, -1):
@@ -252,6 +306,10 @@ async def chat_completions(request: Dict[str, Any]):
                 messages[i] = dict(messages[i])
                 messages[i]["content"] = str(messages[i].get("content", "")) + f"\n\n[CORRECTION] {loop_hint}"
                 break
+
+    # 3c. Truncation reminder — when last user message contains Roo Code's truncation notice,
+    #     remind the model it may use read_file offset= or write_to_file but must NOT hallucinate [Tool Result]
+    messages = _inject_truncation_reminder(messages, request_id)
 
     # 4. Call upstream LLM (no native tools forwarded — model doesn't support them)
     # Default to 8192 tokens if not specified — many models have low defaults (e.g. 2048)
@@ -377,6 +435,12 @@ async def chat_completions(request: Dict[str, Any]):
     # 9. NORMALIZE: apply_diff with only additions → write_to_file (model tries to create new files)
     if tool_calls:
         tool_calls = convert_new_file_diffs(tool_calls, tool_names, request_id)
+        assistant_message["tool_calls"] = tool_calls or None
+
+    # 9b. VALIDATE: drop apply_diff / replace_in_file calls with incomplete diffs
+    #     (missing >>>>>>> REPLACE marker = truncated or corrupt model output)
+    if tool_calls:
+        tool_calls = validate_apply_diff_completeness(tool_calls, request_id)
         assistant_message["tool_calls"] = tool_calls or None
 
     # 10. RESCUE: if attempt_completion.result contains XML tool calls, extract them

@@ -73,14 +73,18 @@ def detect_success_loop(
     )
     if client_type == ClientType.OPEN_CODE:
         return (
-            f"STOP: The file operation has already succeeded {success_count} times. "
-            "Do NOT repeat the tool call — you are creating duplicates. "
-            "The task is done — respond with a brief plain-text summary."
+            f"STOP: The file operation reported success {success_count} times in a row "
+            "but the task may not be complete. "
+            "Use read_file to verify the current file state, "
+            "or use write_to_file with the COMPLETE corrected content. "
+            "Do NOT repeat the same partial operation again."
         )
     return (
-        f"STOP: The file operation has already succeeded {success_count} times. "
-        "Do NOT repeat the tool call — you are creating duplicates. "
-        "Call attempt_completion to report that the task is done."
+        f"STOP: The file operation reported success {success_count} times in a row "
+        "but the task may not be complete. "
+        "Use read_file to verify the current file state, "
+        "or use write_to_file with the COMPLETE corrected content. "
+        "If the task is truly done, call attempt_completion."
     )
 
 
@@ -168,11 +172,13 @@ def detect_repetitive_tool_loop(
     if client_type == ClientType.OPEN_CODE:
         return (
             f"STOP: You have called '{tool_name}' {consecutive} times in a row "
-            "without making progress. Re-read the task and try a different approach. "
-            "Do not repeat the same tool call again."
+            "without making progress. Use write_to_file with the COMPLETE corrected "
+            "content, or read_file to verify the current state first. "
+            "Do not repeat the same partial operation again."
         )
     return (
         f"STOP: You have called '{tool_name}' {consecutive} times in a row "
-        "without making progress. Re-read the task and use a different approach. "
-        "If the task is already done, call attempt_completion."
+        "without making progress. Use write_to_file with the COMPLETE corrected "
+        "content, or read_file to verify the current state first. "
+        "Do not repeat the same partial operation again."
     )

@@ -137,7 +137,10 @@ NEVER use any of these formats — they will be ignored:
 - Describing updated file content in a code block — WRONG (see example below)
 - Simulated tool results like `[Tool Result]\nFile: foo.ts\n1 | ...` — WRONG
   `[Tool Result]` is SYSTEM output that appears in user messages. NEVER write it yourself.
-  If a file appears truncated or unreadable, call `write_to_file` with the new content directly.
+- When you see `IMPORTANT: File content truncated.` / `To read more: Use the read_file tool with offset=...`:
+  - You MAY call `read_file` again with `offset=` to read the next page of the file
+  - You MAY call `write_to_file` directly if you already know the correct content
+  - You MUST NOT write `[Tool Result]` anywhere in your response under any circumstance
 
 ## CRITICAL EXAMPLE — updating or extending a file
 
