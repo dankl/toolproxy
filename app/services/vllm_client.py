@@ -106,9 +106,14 @@ class VLLMClient:
                 await asyncio.sleep(2 ** attempt)
 
             except httpx.HTTPStatusError as e:
-                logger.error(f"upstream HTTP error {e.response.status_code}: {e.response.text}")
+                status = e.response.status_code
+                body = e.response.text
+                logger.error(f"upstream HTTP error {status}: {body}")
+                # 4xx are client errors — never retry (content filter, bad request, etc.)
+                if status < 500:
+                    raise
                 # Retry on 5xx (transient upstream errors)
-                if e.response.status_code >= 500 and attempt < self.max_retries - 1:
+                if attempt < self.max_retries - 1:
                     wait = 2 ** attempt
                     logger.warning(f"Upstream 5xx — retrying in {wait}s (attempt {attempt + 1}/{self.max_retries})")
                     await asyncio.sleep(wait)

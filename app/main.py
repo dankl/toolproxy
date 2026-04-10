@@ -30,7 +30,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.config import settings
 from app.services.file_write_guard import guard_write_to_file
-from app.services.loop_detection import detect_repetitive_tool_loop, detect_success_loop
+from app.services.loop_detection import detect_ask_followup_loop, detect_repetitive_tool_loop, detect_success_loop
 from app.services.message_normalizer import normalize_messages
 from app.services.priming import inject_priming
 from app.services.text_synthesis import synthesize_tool_call_from_text
@@ -62,7 +62,7 @@ from app.services.xml_parser import (
 from app.services.audit_log import extract_file_info, setup_audit_logger, write_audit
 from app.services.xml_prompt_builder import build_xml_system_prompt
 
-VERSION = "1.6.7"  # Truncation: reminder bans apply_diff; validate_apply_diff_completeness drops corrupt diffs
+VERSION = "1.6.13"  # text_synthesis: rescue truncated apply_diff XML (missing closing tag)
 
 # Chat-Template-Leak artifacts produced by gpt-oss models — strip these from preamble text
 # but preserve any legitimate reasoning the model outputs before the XML tool call.
@@ -296,9 +296,12 @@ async def chat_completions(request: Dict[str, Any]):
     # apply_diff called on the same file 3× in a row.  detect_success_loop fires at
     # threshold=2 with a broader hint; it acts as a fallback for write-type loops that
     # don't yet reach the repetitive threshold.
+    # detect_ask_followup_loop uses a frequency window (not consecutive) because Roo Code
+    # sends a genuine user message after each answer, which would reset a consecutive counter.
     loop_hint = (
         detect_repetitive_tool_loop(messages, request_id, client_type)
         or detect_success_loop(messages, request_id, client_type)
+        or detect_ask_followup_loop(messages, request_id, client_type)
     )
     if loop_hint:
         for i in range(len(messages) - 1, -1, -1):
@@ -327,7 +330,61 @@ async def chat_completions(request: Dict[str, Any]):
         _audit["mechanism"] = "upstream_error"
         _audit["error"] = type(e).__name__
         _write_audit_entry(_audit)
-        logger.error(f"[{request_id}] Upstream error after retries: {e}")
+
+        # httpx.HTTPStatusError: str(e) is just "Client error '400 Bad Request' for url '...'"
+        # — the response body (which contains the OCI error detail) is in e.response.text.
+        err_str = str(e)
+        response_body = ""
+        if hasattr(e, "response"):
+            try:
+                response_body = e.response.text or ""
+            except Exception:
+                pass
+        combined = (err_str + " " + response_body).lower()
+        is_content_filter = "inappropriate content" in combined
+        is_empty_response = "oci model returned an empty response" in combined
+
+        if is_empty_response:
+            logger.error(
+                f"[{request_id}] OCI silent rate-limiting / empty response (500). "
+                f"OCI returned HTTP 200 with empty body — transient, retry the request."
+            )
+            return JSONResponse(
+                status_code=503,
+                content={"error": {
+                    "message": "OCI model returned an empty response (silent rate-limiting). "
+                               "This is transient — please retry the request.",
+                    "type": "rate_limit_error",
+                }},
+            )
+
+        if is_content_filter:
+            # Log the last user message to help diagnose what triggered the filter
+            last_user = next(
+                (m for m in reversed(messages) if m.get("role") == "user"), None
+            )
+            if last_user:
+                content = str(last_user.get("content", ""))
+                logger.info(
+                    f"[{request_id}] Content-filter trigger — last user message (first 500 chars): "
+                    f"{content[:500]!r}"
+                )
+            logger.error(
+                f"[{request_id}] OCI content filter blocked request (400). "
+                f"See INFO log above for triggering content."
+            )
+            return JSONResponse(
+                status_code=400,
+                content={"error": {
+                    "message": "Request blocked by OCI content filter: Inappropriate content detected. "
+                               "The conversation may contain content that triggers Oracle's safety filter "
+                               "(e.g. security-related code, certain keywords). "
+                               "Try rephrasing or splitting the request.",
+                    "type": "content_filter_error",
+                }},
+            )
+
+        logger.error(f"[{request_id}] Upstream error: {e}")
         return JSONResponse(
             status_code=502,
             content={"error": {"message": f"Upstream LLM error: {e}", "type": "upstream_error"}},

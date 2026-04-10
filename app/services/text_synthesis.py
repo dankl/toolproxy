@@ -4,6 +4,7 @@ Text-synthesis helpers for toolproxy.
 When the model returns plain prose instead of an XML tool call, these functions
 infer the correct tool call from context.
 """
+import html
 import json
 import logging
 import re
@@ -15,9 +16,14 @@ _FILE_EXTENSIONS = {"md", "py", "ts", "js", "json", "yaml", "yml", "txt", "toml"
 
 
 def _extract_target_file_from_context(messages: List[Dict]) -> Optional[str]:
-    """Return the most likely target file path from VSCode Open Tabs in the last user message."""
+    """Return the most likely target file path from VSCode Open Tabs in the last user message.
+
+    Only returns a file if it is explicitly named in the user's task text (the part
+    of the message *before* the VSCode Open Tabs section). Searching the full message
+    text would always match because every candidate is listed in the tabs themselves.
+    """
     candidate_files: List[str] = []
-    user_text = ""
+    task_text = ""  # user text EXCLUDING the Open Tabs section
 
     for msg in reversed(messages):
         if msg.get("role") != "user":
@@ -28,26 +34,29 @@ def _extract_target_file_from_context(messages: List[Dict]) -> Optional[str]:
             if not isinstance(item, dict) or item.get("type") != "text":
                 continue
             text = item.get("text", "")
-            user_text += " " + text
             tabs_match = re.search(r"# VSCode Open Tabs\n(.*?)(?:\n\n|\n#)", text, re.DOTALL)
             if tabs_match:
+                # Only consider text BEFORE the Open Tabs section as the user's intent
+                task_text += " " + text[:tabs_match.start()]
                 for tab in tabs_match.group(1).split(","):
                     tab = tab.strip()
                     ext = tab.rsplit(".", 1)[-1].lower() if "." in tab else ""
                     if ext in _FILE_EXTENSIONS and not tab.startswith("../") and "/tmp/" not in tab:
                         candidate_files.append(tab)
+            else:
+                task_text += " " + text
         break  # only look at the most recent user message
 
     if not candidate_files:
         return None
-    if len(candidate_files) == 1:
-        return candidate_files[0]
 
-    user_lower = user_text.lower()
+    # Require the filename to appear explicitly in the user's task text.
+    # No fallback to candidate_files[0] — an unmentioned open tab is never a safe target.
+    task_lower = task_text.lower()
     for f in candidate_files:
-        if f.rsplit("/", 1)[-1].lower() in user_lower:
+        if f.rsplit("/", 1)[-1].lower() in task_lower:
             return f
-    return candidate_files[0]
+    return None
 
 
 def _was_recently_written(path: str, messages: List[Dict], lookback: int = 10) -> bool:
@@ -147,6 +156,35 @@ def synthesize_tool_call_from_text(
                     "function": {
                         "name": "write_to_file",
                         "arguments": json.dumps({"path": path_val, "content": content_val}),
+                    },
+                }]
+
+    # Rescue truncated or otherwise unmatched apply_diff XML.
+    # Triggers when the response starts with <apply_diff> but extract_xml_tool_calls found
+    # nothing — typically because </apply_diff> is missing (OCI/vLLM cut off the response
+    # before the closing tag).  We extract path + diff via regex and HTML-unescape the diff
+    # content (the model often entity-encodes <<<<<<< SEARCH as &lt;&lt;&lt;... etc.).
+    # validate_apply_diff_completeness in main.py step 9b will drop the call cleanly if the
+    # diff itself is also truncated (missing >>>>>>> REPLACE).
+    if looks_like_xml_tool_call and "apply_diff" in tool_names:
+        m = re.search(
+            r"<apply_diff\b[^>]*>\s*<path>(.*?)</path>\s*<diff>([\s\S]+?)(?:</diff>|$)",
+            stripped,
+            re.IGNORECASE,
+        )
+        if m:
+            path_val = html.unescape(m.group(1).strip())
+            diff_val = html.unescape(m.group(2).strip())
+            if path_val and diff_val:
+                logger.info(
+                    f"[{request_id}] Partial XML rescue → apply_diff({path_val!r})"
+                )
+                return [{
+                    "id": f"call_{request_id}_apply_diff",
+                    "type": "function",
+                    "function": {
+                        "name": "apply_diff",
+                        "arguments": json.dumps({"path": path_val, "diff": diff_val}),
                     },
                 }]
 

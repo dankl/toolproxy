@@ -188,8 +188,23 @@ def fix_xml_string(xml_string: str) -> str:
             inner = inner.replace('<', '&lt;').replace('>', '&gt;')
         return f'<{tag}>{inner}</{tag}>'
 
-    # Insert missing </diff> BEFORE escaping so the escape regex can match the full <diff> block
+    # Fix mismatched closing tags for simple parameter tags (no nested XML in their content).
+    # The model sometimes closes <path> with </diff> (anticipating the next sibling tag name).
+    # e.g. <path>src/Foo.java</diff> → <path>src/Foo.java</path>
+    _SIMPLE_PARAM_TAGS = (
+        "path", "filePath", "source", "destination",
+        "command", "description", "question", "regex",
+    )
     fixed = xml_string
+    for _tag in _SIMPLE_PARAM_TAGS:
+        fixed = re.sub(
+            rf'<{re.escape(_tag)}>([^<]*?)</(?!{re.escape(_tag)}\s*>)[a-zA-Z_][a-zA-Z0-9_]*\s*>',
+            rf'<{_tag}>\1</{_tag}>',
+            fixed,
+            flags=re.IGNORECASE,
+        )
+
+    # Insert missing </diff> BEFORE escaping so the escape regex can match the full <diff> block
     if re.search(r'<diff\b', fixed, re.IGNORECASE) and not re.search(r'</diff>', fixed, re.IGNORECASE):
         fixed = re.sub(
             r'</(apply_diff|replace_in_file)>',

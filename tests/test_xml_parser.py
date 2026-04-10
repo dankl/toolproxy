@@ -138,6 +138,51 @@ class TestFixXmlString:
         root = ET.fromstring(fixed)
         assert root.find("path").text == "src/main/java/App.java"
 
+    def test_mismatched_path_tag_fixed(self):
+        """
+        Model closes <path> with </diff> (anticipates the next sibling tag name).
+        fix_xml_string must correct the closing tag so ET can parse the XML.
+
+        Real-world example from logs (v1.6.10):
+          <apply_diff>
+            <path>src/.../StringLatinPatternUpdater.java</diff>  ← wrong
+            <diff>...</diff>
+          </apply_diff>
+        """
+        xml = (
+            "<apply_diff>"
+            "<path>src/main/java/Foo.java</diff>"
+            "<diff><<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE</diff>"
+            "</apply_diff>"
+        )
+        fixed = fix_xml_string(xml)
+        root = ET.fromstring(fixed)  # must not raise ParseError
+        assert root.find("path").text == "src/main/java/Foo.java"
+
+    def test_mismatched_path_tag_various_wrong_closers(self):
+        """Fix works regardless of which wrong closing tag the model uses."""
+        for wrong in ("diff", "content", "result", "apply_diff"):
+            xml = f"<write_to_file><path>src/App.java</{wrong}><content>x</content></write_to_file>"
+            fixed = fix_xml_string(xml)
+            try:
+                root = ET.fromstring(fixed)
+                assert root.find("path").text == "src/App.java", f"path wrong for </{wrong}>"
+            except ET.ParseError as e:
+                raise AssertionError(f"ParseError for </{wrong}>: {e}\nFixed: {fixed}")
+
+    def test_correct_tags_not_modified_by_mismatch_fix(self):
+        """Correctly matched tags must be untouched."""
+        xml = (
+            "<apply_diff>"
+            "<path>src/main/java/Foo.java</path>"
+            "<diff>content</diff>"
+            "</apply_diff>"
+        )
+        fixed = fix_xml_string(xml)
+        root = ET.fromstring(fixed)
+        assert root.find("path").text == "src/main/java/Foo.java"
+        assert root.find("diff").text == "content"
+
     def test_multiline_content_with_xml_snippets(self):
         """README-style content with multiple XML-like elements."""
         inner = (

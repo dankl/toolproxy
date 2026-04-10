@@ -182,3 +182,54 @@ def detect_repetitive_tool_loop(
         "content, or read_file to verify the current state first. "
         "Do not repeat the same partial operation again."
     )
+
+
+# ---------------------------------------------------------------------------
+# ask_followup_question loop detection
+# ---------------------------------------------------------------------------
+
+# Window size and threshold for ask_followup_question frequency detection.
+# Each ask_followup_question cycle adds 3 messages (tool call + tool result +
+# genuine user reply), so a window of 24 covers 8 cycles.
+_AFQ_WINDOW = 24
+_AFQ_THRESHOLD = 3
+
+_AFQ_RE = re.compile(r"<ask_followup_question[\s>]", re.IGNORECASE)
+
+
+def detect_ask_followup_loop(
+    messages: List[Dict],
+    request_id: str = "",
+    client_type: ClientType = ClientType.ROO_CODE,
+) -> Optional[str]:
+    """
+    Detect when the model repeatedly calls ask_followup_question without making
+    progress.
+
+    Unlike detect_repetitive_tool_loop, this detector uses a frequency window
+    rather than consecutive counting — because Roo Code sends a genuine user
+    message after each answer, which would reset a consecutive counter.
+
+    Fires when ask_followup_question appears >= _AFQ_THRESHOLD times in the
+    last _AFQ_WINDOW messages.
+    """
+    recent = messages[-_AFQ_WINDOW:] if len(messages) > _AFQ_WINDOW else messages
+    count = sum(
+        1
+        for msg in recent
+        if msg.get("role") == "assistant" and _AFQ_RE.search(str(msg.get("content", "")))
+    )
+
+    if count < _AFQ_THRESHOLD:
+        return None
+
+    logger.warning(
+        f"[{request_id}] ASK FOLLOWUP LOOP: ask_followup_question called {count}× "
+        f"in last {len(recent)} messages — injecting correction hint"
+    )
+    return (
+        f"STOP: You have asked ask_followup_question {count} times without making progress. "
+        "The user has already provided their input. "
+        "Stop asking clarifying questions and take direct action based on the information you have. "
+        "If something is unclear, make a reasonable assumption and proceed."
+    )

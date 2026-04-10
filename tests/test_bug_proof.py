@@ -11,7 +11,7 @@ import shlex
 import json
 import pytest
 
-from app.services.loop_detection import detect_success_loop
+from app.services.loop_detection import detect_ask_followup_loop, detect_success_loop
 from app.services.message_normalizer import normalize_messages
 from app.services.tool_call_fixups import (
     convert_move_file_to_execute_command,
@@ -952,3 +952,105 @@ class TestValidateApplyDiffCompleteness:
         tc = self._make_tc("apply_diff", "")
         result = validate_apply_diff_completeness(tc, "test")
         assert len(result) == 1, "Empty diff must not be dropped (handled elsewhere)"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ask_followup_question loop detection (v1.6.11)
+#
+# Roo Code sends a genuine user message after each answer, resetting the
+# consecutive counter in detect_repetitive_tool_loop. The new frequency-window
+# detector catches this pattern instead.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _afq_msg(question: str = "How to proceed?") -> dict:
+    """Build a normalized assistant message with an ask_followup_question call."""
+    return {
+        "role": "assistant",
+        "content": f"<ask_followup_question><question>{question}</question>"
+                   "<follow_up><option>Option A</option></follow_up></ask_followup_question>",
+    }
+
+
+def _afq_result(answer: str = "Option A") -> list:
+    """Simulate one Roo Code cycle: tool result + genuine user reply."""
+    return [
+        {"role": "user", "content": f"[Tool Result]\n{answer}"},
+        {"role": "user", "content": "Please continue."},
+    ]
+
+
+class TestAskFollowupLoop:
+
+    def test_three_ask_followup_calls_trigger_hint(self):
+        """
+        3 ask_followup_question calls in recent history → hint fires.
+        Reproduces the real pattern where Roo Code sends a genuine user message
+        after each answer, which would reset the consecutive counter.
+        """
+        messages = [{"role": "user", "content": "Fix the schema issue."}]
+        for _ in range(3):
+            messages.append(_afq_msg())
+            messages.extend(_afq_result())
+
+        result = detect_ask_followup_loop(messages)
+        assert result is not None, (
+            "Expected loop hint after 3 ask_followup_question calls, got None. "
+            "Frequency-window detector should fire regardless of genuine user messages in between."
+        )
+        assert "ask_followup_question" in result.lower()
+
+    def test_two_ask_followup_calls_no_hint(self):
+        """Below threshold (2 calls) — no hint."""
+        messages = [{"role": "user", "content": "Fix the schema issue."}]
+        for _ in range(2):
+            messages.append(_afq_msg())
+            messages.extend(_afq_result())
+
+        result = detect_ask_followup_loop(messages)
+        assert result is None, (
+            f"Expected no hint for 2 ask_followup_question calls, got: {result!r}"
+        )
+
+    def test_hint_fires_even_with_genuine_user_messages_between(self):
+        """
+        The core of the fix: genuine user messages between calls must NOT prevent detection.
+        This is exactly what broke detect_repetitive_tool_loop for this pattern.
+        """
+        messages = [
+            {"role": "user", "content": "Task description"},
+            _afq_msg("What approach?"),
+            {"role": "user", "content": "[Tool Result]\nAdd placeholder"},
+            {"role": "user", "content": "Please proceed."},   # ← genuine user msg resets consecutive
+            _afq_msg("How to proceed?"),
+            {"role": "user", "content": "[Tool Result]\nOption A"},
+            {"role": "user", "content": "Continue please."},  # ← another reset
+            _afq_msg("Are you sure?"),
+            {"role": "user", "content": "[Tool Result]\nYes"},
+            {"role": "user", "content": "Go ahead."},
+        ]
+        result = detect_ask_followup_loop(messages)
+        assert result is not None, (
+            "Frequency-window detector must fire even with genuine user messages between calls."
+        )
+
+    def test_old_ask_followup_outside_window_not_counted(self):
+        """
+        ask_followup_question calls outside the window (_AFQ_WINDOW=24) must not count.
+        Long conversations should not be penalized for questions asked much earlier.
+        """
+        old_messages = []
+        for _ in range(5):  # 5 old cycles, outside the window
+            old_messages.append(_afq_msg())
+            old_messages.extend(_afq_result())
+
+        # Pad with unrelated turns to push old messages out of the window
+        padding = [{"role": "user", "content": f"[Tool Result]\nStep {i}"} for i in range(20)]
+        recent = [
+            _afq_msg(),          # only 1 recent call
+            {"role": "user", "content": "[Tool Result]\nOption A"},
+        ]
+        messages = old_messages + padding + recent
+        result = detect_ask_followup_loop(messages)
+        assert result is None, (
+            "Old ask_followup_question calls outside the window must not trigger the hint."
+        )

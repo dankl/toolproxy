@@ -11,14 +11,13 @@ Run (requires oci-proxy at localhost:8015 or set TOOLPROXY_UPSTREAM_URL):
 import asyncio
 import json
 import pytest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 import httpx
 
 import app.main as main_module
 from app.services.vllm_client import VLLMClient
 from tests.conftest import _tool, user_msg
 from tests.live.conftest import (
-    UPSTREAM_URL,
     ROO_CODE_TOOLS,
     TOOL_WRITE_TO_FILE,
     TOOL_READ_FILE,
@@ -603,3 +602,157 @@ class TestApplyDiffLoop:
             "The success_loop hint must not say 'call attempt_completion' — "
             "it should suggest read_file or write_to_file instead."
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.6.13 — Truncated apply_diff rescue
+#
+# When OCI cuts off the model response before </apply_diff>, the XML parser
+# finds 0 matches and text_synthesis previously fell through to attempt_completion,
+# silently discarding the diff.
+#
+# Fix: partial XML rescue in text_synthesis extracts <path> and <diff> via regex
+# even without closing tags, HTML-unescapes the diff content, and returns a
+# proper apply_diff tool call. validate_apply_diff_completeness (step 9b) then
+# catches diffs that are also incomplete (missing >>>>>>> REPLACE).
+# ─────────────────────────────────────────────────────────────────────────────
+
+_TRUNCATED_APPLY_DIFF_OUTPUT = (
+    "<apply_diff>"
+    "<path>src/main/java/de/example/FooService.java</path>"
+    "<diff>"
+    "&lt;&lt;&lt;&lt;&lt;&lt;&lt; SEARCH\n"
+    ":start_line:12\n"
+    "-------\n"
+    "    public String oldMethod() {\n"
+    "        return \"old\";\n"
+    "    }\n"
+    "=======\n"
+    "    public String newMethod() {\n"
+    "        return \"new\";\n"
+    "    }\n"
+    "&gt;&gt;&gt;&gt;&gt;&gt;&gt; REPLACE\n"
+    "</diff>"
+    # </apply_diff> intentionally missing — simulates OCI truncation
+)
+
+_TRUNCATED_APPLY_DIFF_RESPONSE = {
+    "id": "test-truncated-apply-diff",
+    "created": 1_700_000_000,
+    "choices": [{
+        "index": 0,
+        "message": {
+            "role": "assistant",
+            "content": _TRUNCATED_APPLY_DIFF_OUTPUT,
+            "tool_calls": None,
+        },
+        "finish_reason": "stop",
+    }],
+    "usage": {"prompt_tokens": 200, "completion_tokens": 500, "total_tokens": 700},
+}
+
+
+class TestTruncatedApplyDiffRescue:
+    """
+    E2E tests for the truncated apply_diff rescue (v1.6.13).
+
+    test_truncated_apply_diff_rescued: uses a mocked upstream that returns a
+    realistic truncated apply_diff (entity-encoded diff markers, no closing tag).
+    This always runs and is the primary regression guard.
+
+    test_live_model_apply_diff_end_to_end: uses the real model to verify that
+    normal (complete) apply_diff responses are parsed and forwarded correctly.
+    """
+
+    def test_truncated_apply_diff_rescued(self, client):
+        """
+        Upstream returns an apply_diff without closing </apply_diff> tag.
+        Toolproxy must rescue it and return a proper apply_diff tool call —
+        not an attempt_completion with the raw XML as its result.
+
+        Verifies the full HTTP request/response pipeline:
+          1. Mocked upstream returns truncated XML
+          2. xml_parser finds 0 matches (no closing tag)
+          3. text_synthesis partial XML rescue fires
+          4. apply_diff is returned with decoded diff content
+          5. validate_apply_diff_completeness passes (diff has >>>>>>> REPLACE)
+        """
+        with patch.object(main_module, "upstream_client") as mock_uc:
+            mock_uc.chat_completion = AsyncMock(return_value=_TRUNCATED_APPLY_DIFF_RESPONSE)
+            resp = client.post("/v1/chat/completions", json={
+                "model": "oracle-llm",
+                "messages": [SYSTEM_MSG, user_msg("Rename oldMethod to newMethod in FooService.java")],
+                "tools": [TOOL_APPLY_DIFF, TOOL_ATTEMPT_COMPLETION],
+            })
+
+        assert resp.status_code == 200, resp.text
+        name, args = parse_tool_call(resp.json())
+
+        assert name == "apply_diff", (
+            f"Truncated apply_diff was not rescued — got {name!r}.\n"
+            "Regression: toolproxy fell through to attempt_completion and discarded the diff.\n"
+            "Check text_synthesis partial XML rescue for apply_diff."
+        )
+        assert args["path"] == "src/main/java/de/example/FooService.java", (
+            f"Wrong path in rescued apply_diff: {args['path']!r}"
+        )
+        diff = args["diff"]
+        assert "<<<<<<< SEARCH" in diff, (
+            f"HTML entities not decoded in rescued diff.\n"
+            f"Expected '<<<<<<< SEARCH', got: {diff[:100]!r}"
+        )
+        assert ">>>>>>> REPLACE" in diff, (
+            f"Rescued diff is missing >>>>>>> REPLACE marker.\n"
+            f"Diff preview: {diff[:200]!r}"
+        )
+        assert "&lt;" not in diff, f"Unreplaced &lt; entities in diff: {diff[:100]!r}"
+
+    def test_live_model_apply_diff_end_to_end(self, live):
+        """
+        Ask the real model to make a targeted Java change.
+        Verifies that a normal (complete) apply_diff goes through the full
+        pipeline correctly — xml_parser finds it, entities decoded, forwarded.
+        """
+        import os
+        msgs = [
+            SYSTEM_MSG,
+            user_msg("Read the file src/Service.java"),
+            _assistant_tool_call("read_file", {"path": "src/Service.java"}, "call_read_01"),
+            _tool_result(
+                "[Tool Result]\nFile: src/Service.java\n"
+                " 1 | package de.example;\n"
+                " 2 | \n"
+                " 3 | public class Service {\n"
+                " 4 |     public String greet() {\n"
+                " 5 |         return \"hello\";\n"
+                " 6 |     }\n"
+                " 7 | }\n",
+                "call_read_01",
+            ),
+            user_msg(
+                "Use apply_diff to change the return value of greet() "
+                "from \"hello\" to \"hi\" in src/Service.java."
+            ),
+        ]
+        model = os.environ.get("LIVE_MODEL", "openai/gpt-oss-120b")
+        resp = live.post("/v1/chat/completions", json={
+            "model": model,
+            "messages": msgs,
+            "tools": [TOOL_READ_FILE, TOOL_APPLY_DIFF, TOOL_ATTEMPT_COMPLETION],
+        })
+        assert resp.status_code == 200, resp.text
+        name, args = parse_tool_call(resp.json())
+
+        assert name in {"apply_diff", "write_to_file"}, (
+            f"Expected apply_diff or write_to_file for a targeted change, got {name!r}.\n"
+            "If the model used apply_diff, verify the diff content is decoded correctly."
+        )
+        if name == "apply_diff":
+            diff = args.get("diff", "")
+            assert "<<<<<<< SEARCH" in diff, (
+                f"apply_diff diff missing SEARCH marker — entity decoding may be broken.\n"
+                f"Diff preview: {diff[:200]!r}"
+            )
+            assert ">>>>>>> REPLACE" in diff, (
+                f"apply_diff diff missing REPLACE marker.\nDiff: {diff[:200]!r}"
+            )

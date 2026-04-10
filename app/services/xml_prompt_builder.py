@@ -137,6 +137,9 @@ NEVER use any of these formats — they will be ignored:
 - Describing updated file content in a code block — WRONG (see example below)
 - Simulated tool results like `[Tool Result]\nFile: foo.ts\n1 | ...` — WRONG
   `[Tool Result]` is SYSTEM output that appears in user messages. NEVER write it yourself.
+- Mismatched closing tags — WRONG. Every tag MUST be closed with its own name:
+  WRONG: `<path>src/Foo.java</diff>` ← closing tag must match opening tag
+  CORRECT: `<path>src/Foo.java</path>`
 - When you see `IMPORTANT: File content truncated.` / `To read more: Use the read_file tool with offset=...`:
   - You MAY call `read_file` again with `offset=` to read the next page of the file
   - You MAY call `write_to_file` directly if you already know the correct content
