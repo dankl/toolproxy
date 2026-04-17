@@ -261,19 +261,97 @@ def convert_new_file_diffs(
 
 _DIFF_TOOLS = {"apply_diff", "replace_in_file"}
 
+# Matches a unified diff hunk header.
+# Handles both the full form "@@ -1,3 +1,4 @@" and the minimal "@@ " or bare "@@"
+# that some models emit as a shorthand.
+_UNIFIED_HUNK_RE = re.compile(r"^@@", re.MULTILINE)
+# Matches the file header lines produced by git diff / GNU diff
+_UNIFIED_HEADER_RE = re.compile(r"^(?:---|\+\+\+|diff --git)\s", re.MULTILINE)
+
+
+def _convert_unified_diff_to_search_replace(diff: str) -> Optional[str]:
+    """
+    Convert a unified diff to Roo Code / Cline SEARCH/REPLACE format.
+
+    Supports standard git-style unified diffs:
+        @@ -1,3 +1,4 @@
+        -old line
+        +new line
+         context line
+
+    Each hunk becomes one SEARCH/REPLACE block.  Context lines appear in
+    both halves.  The file-header lines (---, +++, diff --git) are ignored.
+
+    Returns the converted diff string, or None if the input does not look
+    like a unified diff (no @@ hunk header found).
+    """
+    if not _UNIFIED_HUNK_RE.search(diff):
+        return None
+
+    lines = diff.splitlines()
+    blocks: List[str] = []
+    search_lines: List[str] = []
+    replace_lines: List[str] = []
+    in_hunk = False
+
+    def _flush():
+        if search_lines or replace_lines:
+            block = (
+                "<<<<<<< SEARCH\n"
+                + "\n".join(search_lines)
+                + ("\n" if search_lines else "")
+                + "=======\n"
+                + "\n".join(replace_lines)
+                + ("\n" if replace_lines else "")
+                + ">>>>>>> REPLACE"
+            )
+            blocks.append(block)
+
+    for line in lines:
+        # Skip file-header lines (---, +++, diff --git ...)
+        if _UNIFIED_HEADER_RE.match(line):
+            continue
+        # Hunk header — start a new block
+        if _UNIFIED_HUNK_RE.match(line):
+            if in_hunk:
+                _flush()
+                search_lines = []
+                replace_lines = []
+            in_hunk = True
+            continue
+        if not in_hunk:
+            continue
+        if line.startswith("-"):
+            search_lines.append(line[1:])
+        elif line.startswith("+"):
+            replace_lines.append(line[1:])
+        else:
+            # Context line — goes into both halves (strip leading space if present)
+            ctx = line[1:] if line.startswith(" ") else line
+            search_lines.append(ctx)
+            replace_lines.append(ctx)
+
+    if in_hunk:
+        _flush()
+
+    if not blocks:
+        return None
+
+    return "\n".join(blocks)
+
 
 def validate_apply_diff_completeness(
     tool_calls: List[Dict], request_id: str
 ) -> List[Dict]:
     """
-    Drop apply_diff / replace_in_file calls whose diff is missing the closing
-    '>>>>>>> REPLACE' marker.
+    Fix or drop apply_diff / replace_in_file calls whose diff is not in the
+    expected SEARCH/REPLACE format.
 
-    A truncated or corrupt model output may produce a diff that starts a REPLACE
-    block but never closes it.  Passing such a diff to Roo Code causes an apply
-    failure.  Dropping the tool call lets the main flow fall through to the empty
-    fallback (attempt_completion) or text synthesis, which is less confusing for
-    the user than a silent patch failure.
+    Strategy (in order):
+    1. If the diff already contains '>>>>>>> REPLACE' → pass through unchanged.
+    2. If the diff looks like a unified diff (has @@ hunk headers) → convert to
+       SEARCH/REPLACE format and pass through with a log line.
+    3. Otherwise → drop the call and let the fallback chain handle it.
     """
     result = []
     for tc in tool_calls:
@@ -289,14 +367,32 @@ def validate_apply_diff_completeness(
             continue
 
         diff = args.get("diff", "")
-        if diff and ">>>>>>> REPLACE" not in diff:
-            logger.warning(
-                f"[{request_id}] Dropping corrupt {name}: "
-                "diff is missing '>>>>>>> REPLACE' closing marker"
-            )
-            continue  # drop — do not append
 
-        result.append(tc)
+        # Already correct format — pass through
+        if not diff or ">>>>>>> REPLACE" in diff:
+            result.append(tc)
+            continue
+
+        # Try unified diff conversion
+        converted = _convert_unified_diff_to_search_replace(diff)
+        if converted:
+            logger.info(
+                f"[{request_id}] Converted unified diff → SEARCH/REPLACE "
+                f"for {name} ({len(converted)} chars)"
+            )
+            args["diff"] = converted
+            tc = dict(tc)
+            tc["function"] = dict(tc["function"])
+            tc["function"]["arguments"] = json.dumps(args)
+            result.append(tc)
+            continue
+
+        # Not unified diff and no REPLACE marker — drop
+        logger.warning(
+            f"[{request_id}] Dropping corrupt {name}: "
+            "diff is missing '>>>>>>> REPLACE' closing marker"
+        )
+        # do not append — drop
 
     return result
 

@@ -56,13 +56,14 @@ from app.services.tool_mapping import (
 from app.services.vllm_client import VLLMClient
 from app.services.xml_parser import (
     convert_xml_tool_calls_to_openai_format,
+    extract_mcp_tool_calls,
     extract_tool_names_from_request,
     extract_xml_tool_calls,
 )
 from app.services.audit_log import extract_file_info, setup_audit_logger, write_audit
 from app.services.xml_prompt_builder import build_xml_system_prompt
 
-VERSION = "1.6.13"  # text_synthesis: rescue truncated apply_diff XML (missing closing tag)
+VERSION = "1.6.22"  # unified diff → SEARCH/REPLACE converter for apply_diff
 
 # Chat-Template-Leak artifacts produced by gpt-oss models — strip these from preamble text
 # but preserve any legitimate reasoning the model outputs before the XML tool call.
@@ -129,6 +130,46 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+class _RedactFilter(logging.Filter):
+    """Replaces configured words in all log messages (case-insensitive)."""
+
+    def __init__(self, words: list[str]) -> None:
+        super().__init__()
+        self._pattern = (
+            re.compile("|".join(re.escape(w) for w in words), re.IGNORECASE)
+            if words else None
+        )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if self._pattern:
+            try:
+                msg = record.getMessage()
+            except Exception:
+                msg = str(record.msg)
+            record.msg = self._pattern.sub("xxx", msg)
+            record.args = None
+        return True
+
+
+_redact_words = [w.strip() for w in settings.log_redact_words.split(",") if w.strip()]
+
+
+def _install_redact_filter() -> None:
+    """Add the redact filter to all active handlers on the root logger.
+
+    Called at startup (after uvicorn has set up its own logging config).
+    Uvicorn replaces handlers via dictConfig — adding to the root logger
+    before startup would be wiped out, so we attach to the handlers instead.
+    """
+    if not _redact_words:
+        return
+    f = _RedactFilter(_redact_words)
+    root = logging.getLogger()
+    for handler in root.handlers:
+        handler.addFilter(f)
+    logger.info("Log redaction active — %d word(s) configured", len(_redact_words))
+
+
 def _write_audit_entry(entry: Dict[str, Any]) -> None:
     """Fire-and-forget wrapper so audit errors never bubble up to the client."""
     try:
@@ -147,6 +188,7 @@ upstream_client: VLLMClient = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global upstream_client
+    _install_redact_filter()
     logger.info(
         f"toolproxy starting | upstream={settings.upstream_url} | model={settings.upstream_model}"
     )
@@ -440,7 +482,36 @@ async def chat_completions(request: Dict[str, Any]):
             names = ", ".join(tc["function"]["name"] for tc in tool_calls)
             logger.info(f"[{request_id}] XML parsed {len(tool_calls)} tool call(s): {names}")
 
-    # 5b. FIXUP: move_file / rename_file → execute_command(mv ...)
+    # 5a. MCP TOOL CALLS: <use_mcp_tool> format (Roo Code XML mode with MCP servers)
+    #     Triggered when tools=0 but model outputs use_mcp_tool blocks.
+    #     Tool name: "{server_name}__{tool_name}" (e.g. "grafana-mcp__list_datasources")
+    if not tool_calls and content:
+        mcp_calls, mcp_remaining = extract_mcp_tool_calls(content, request_id)
+        if mcp_calls:
+            tool_calls = convert_xml_tool_calls_to_openai_format(mcp_calls)
+            assistant_message["tool_calls"] = tool_calls
+            preamble = _LEAK_PATTERN.sub("", mcp_remaining).strip()
+            assistant_message["content"] = preamble or None
+            _audit["mechanism"] = "mcp_xml_parsed"
+            names = ", ".join(tc["function"]["name"] for tc in tool_calls)
+            logger.info(f"[{request_id}] MCP XML parsed {len(tool_calls)} tool call(s): {names}")
+
+    # 5b. HINT: raw XML detected with no tool definitions (tools=0)
+    #     When the model outputs bare <tool_name>...</tool_name> XML but no tools were
+    #     registered, append a hint so the model learns to use <use_mcp_tool> next turn.
+    if not tool_calls and content and not tool_names:
+        if re.search(r"<[a-z][a-z_]+>", content):
+            hint = (
+                "\n\n[toolproxy] No tool definitions registered for this session. "
+                "To call MCP tools, use the <use_mcp_tool> wrapper:\n"
+                "<use_mcp_tool><server_name>SERVER</server_name>"
+                "<tool_name>TOOL</tool_name><arguments>{...}</arguments></use_mcp_tool>"
+            )
+            assistant_message["content"] = content + hint
+            logger.info(f"[{request_id}] Raw XML detected with tools=0 — injecting use_mcp_tool hint")
+            _audit["mechanism"] = "mcp_hint_injected"
+
+    # 5c. FIXUP: move_file / rename_file → execute_command(mv ...)
     #     These are Roo builtins not in tools[] — Roo Code silently drops them.
     if tool_calls:
         tool_calls = convert_move_file_to_execute_command(tool_calls, tool_names, request_id)

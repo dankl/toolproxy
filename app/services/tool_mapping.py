@@ -236,6 +236,9 @@ def _remap_args_to_schema(
         except (json.JSONDecodeError, TypeError):
             result.append(tc)
             continue
+        if not isinstance(args, dict):
+            result.append(tc)
+            continue
         remapped = {}
         changed = False
         for key, value in args.items():

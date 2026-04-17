@@ -330,6 +330,89 @@ def dict_to_xml_element(
     return ET.tostring(root, encoding="unicode")
 
 
+def extract_mcp_tool_calls(
+    content: str,
+    request_id: str = ""
+) -> Tuple[List[XMLToolCall], str]:
+    """
+    Extract <use_mcp_tool> blocks from Roo Code XML-mode responses.
+
+    Roo Code uses this format when operating in XML mode (tools=0, system-prompt
+    based tool definitions) and MCP servers are connected:
+
+        <use_mcp_tool>
+          <server_name>grafana-mcp</server_name>
+          <tool_name>list_datasources</tool_name>
+          <arguments>{"type": "loki"}</arguments>
+        </use_mcp_tool>
+
+    The resulting tool call name follows Roo Code's native-mode convention:
+    "{server_name}__{tool_name}" (e.g. "grafana-mcp__list_datasources").
+    """
+    log_prefix = f"[{request_id}] " if request_id else ""
+
+    if not content or "<use_mcp_tool" not in content.lower():
+        return [], content
+
+    pattern = re.compile(
+        r"<use_mcp_tool\b[^>]*>([\s\S]*?)</use_mcp_tool>",
+        re.IGNORECASE,
+    )
+
+    tool_calls: List[XMLToolCall] = []
+    remaining_content = content
+
+    for match in pattern.finditer(content):
+        xml_content = match.group(0)
+        inner = match.group(1)
+
+        try:
+            server_match = re.search(
+                r"<server_name[^>]*>([\s\S]*?)</server_name>", inner, re.IGNORECASE
+            )
+            server_name = server_match.group(1).strip() if server_match else ""
+
+            tool_name_match = re.search(
+                r"<tool_name[^>]*>([\s\S]*?)</tool_name>", inner, re.IGNORECASE
+            )
+            if not tool_name_match:
+                logger.warning(f"{log_prefix}use_mcp_tool block missing <tool_name> — skipping")
+                continue
+            tool_name = tool_name_match.group(1).strip()
+
+            args_match = re.search(
+                r"<arguments[^>]*>([\s\S]*?)</arguments>", inner, re.IGNORECASE
+            )
+            arguments_raw = args_match.group(1).strip() if args_match else "{}"
+
+            try:
+                arguments = json.loads(arguments_raw) if arguments_raw else {}
+            except json.JSONDecodeError:
+                logger.warning(
+                    f"{log_prefix}use_mcp_tool arguments not valid JSON, using raw string: "
+                    f"{arguments_raw[:80]}"
+                )
+                arguments = {"_raw": arguments_raw}
+
+            full_name = f"{server_name}__{tool_name}" if server_name else tool_name
+
+            tool_call = XMLToolCall(
+                name=full_name,
+                arguments=arguments,
+                id=generate_tool_id(xml_content),
+                raw_xml=xml_content,
+            )
+            tool_calls.append(tool_call)
+            remaining_content = remaining_content.replace(xml_content, "", 1)
+            logger.debug(f"{log_prefix}Extracted MCP tool call: {full_name}")
+
+        except Exception as e:
+            logger.warning(f"{log_prefix}Failed to parse use_mcp_tool block: {e}")
+            continue
+
+    return tool_calls, remaining_content.strip()
+
+
 def extract_tool_names_from_request(request_tools: List[Dict]) -> List[str]:
     """
     Extract tool names from request tools list.

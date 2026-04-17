@@ -13,6 +13,7 @@ import pytest
 
 from app.services.loop_detection import detect_ask_followup_loop, detect_success_loop
 from app.services.message_normalizer import normalize_messages
+from tests.conftest import _tool, DEFAULT_TOOLS
 from app.services.tool_call_fixups import (
     convert_move_file_to_execute_command,
     fix_ask_followup_question_params,
@@ -853,6 +854,174 @@ class TestGenericTruncationDetection:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# FIX v1.6.14: Search-loop hint is tool-aware + ONE CALL enforcement
+# File: app/services/loop_detection.py
+#
+# Previously detect_repetitive_tool_loop gave the same hint for ALL tools:
+#   "Use write_to_file with the COMPLETE corrected content"
+#
+# For search tools (search_files, list_files, read_file, grep, glob) this
+# is nonsensical — the model interprets it as "I need to try harder" and
+# batches 14 calls in one response (observed in prod log 2026-04-10).
+#
+# Fix 1: tool-aware hint — search tools get "item likely doesn't exist, try a
+#         completely different approach or call attempt_completion".
+# Fix 2: all hints now include "CRITICAL: Always send exactly ONE tool call
+#         per response — never batch multiple calls."
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestSearchLoopHint:
+    """
+    Verify that search tool loops produce a search-appropriate hint (not a
+    write-tool hint), and that all hints enforce the ONE CALL rule.
+    """
+
+    def _build_search_loop_history(self, tool: str, path: str, repeats: int) -> list:
+        """Build a normalized history with N consecutive identical search calls."""
+        msgs = [
+            {"role": "system", "content": "You are a coding assistant."},
+            {"role": "user", "content": f"Find where helm upgrade is called in the project."},
+        ]
+        for i in range(repeats):
+            msgs.append({
+                "role": "assistant",
+                "content": f"<{tool}>\n<path>{path}</path>\n<regex>helm upgrade</regex>\n</{tool}>",
+            })
+            msgs.append({
+                "role": "user",
+                "content": "[Tool Result]\nNo matches found.",
+            })
+        return msgs
+
+    def test_search_loop_hint_does_not_say_write_to_file(self):
+        """
+        After 3× search_files with no results, the hint must NOT say
+        'Use write_to_file' — that makes no sense for a search operation
+        and causes the model to batch multiple calls instead.
+
+        FAILS before fix: hint says 'Use write_to_file with the COMPLETE corrected content'
+        PASSES after fix: hint says 'try a completely different approach'
+        """
+        from app.services.loop_detection import detect_repetitive_tool_loop
+        from app.services.tool_mapping import ClientType
+
+        msgs = self._build_search_loop_history("search_files", ".", repeats=3)
+        hint = detect_repetitive_tool_loop(msgs, "test", ClientType.ROO_CODE)
+
+        assert hint is not None, (
+            "detect_repetitive_tool_loop must fire after 3 consecutive search_files calls."
+        )
+        assert "write_to_file" not in hint, (
+            f"Search-loop hint must NOT mention write_to_file — this is a search operation.\n"
+            f"Got: {hint!r}\n"
+            "Saying 'use write_to_file' causes the model to batch multiple search calls."
+        )
+
+    def test_search_loop_hint_suggests_different_approach(self):
+        """
+        The search-loop hint must suggest stopping or trying a different approach,
+        not repeating the same search operation.
+        """
+        from app.services.loop_detection import detect_repetitive_tool_loop
+        from app.services.tool_mapping import ClientType
+
+        msgs = self._build_search_loop_history("search_files", ".", repeats=3)
+        hint = detect_repetitive_tool_loop(msgs, "test", ClientType.ROO_CODE)
+
+        assert hint is not None
+        assert "different" in hint.lower() or "attempt_completion" in hint, (
+            f"Search-loop hint must suggest a different approach or attempt_completion.\n"
+            f"Got: {hint!r}"
+        )
+
+    def test_search_loop_hint_contains_one_call_rule(self):
+        """
+        The hint for a search loop must explicitly say to send ONE tool call —
+        not batch multiple calls. This prevents the '14 calls at once' behaviour.
+
+        FAILS before fix: hint has no mention of batching prohibition.
+        PASSES after fix: hint includes 'ONE tool call' / 'never batch'.
+        """
+        from app.services.loop_detection import detect_repetitive_tool_loop
+        from app.services.tool_mapping import ClientType
+
+        msgs = self._build_search_loop_history("search_files", ".", repeats=3)
+        hint = detect_repetitive_tool_loop(msgs, "test", ClientType.ROO_CODE)
+
+        assert hint is not None
+        assert "ONE" in hint or "one" in hint.lower(), (
+            f"Search-loop hint must enforce the ONE tool call rule.\n"
+            f"Got: {hint!r}"
+        )
+
+    def test_write_loop_hint_also_contains_one_call_rule(self):
+        """
+        The write-type loop hint (apply_diff / write_to_file) must also include
+        the ONE CALL enforcement after fix 2.
+        """
+        from app.services.loop_detection import detect_repetitive_tool_loop
+        from app.services.tool_mapping import ClientType
+
+        file_path = "src/main/java/Foo.java"
+        msgs = [
+            {"role": "system", "content": "You are a coding assistant."},
+            {"role": "user", "content": "Fix Foo.java"},
+        ]
+        for i in range(3):
+            msgs.append({
+                "role": "assistant",
+                "content": f"<apply_diff>\n<path>{file_path}</path>\n<diff>some diff</diff>\n</apply_diff>",
+            })
+            msgs.append({
+                "role": "user",
+                "content": '[Tool Result]\n{"operation":"modified"}',
+            })
+
+        hint = detect_repetitive_tool_loop(msgs, "test", ClientType.ROO_CODE)
+        assert hint is not None
+        assert "ONE" in hint or "one" in hint.lower(), (
+            f"Write-loop hint must also enforce the ONE tool call rule.\n"
+            f"Got: {hint!r}"
+        )
+
+    def test_list_files_loop_treated_as_search_tool(self):
+        """list_files is in _SEARCH_TOOLS — must get the search-appropriate hint."""
+        from app.services.loop_detection import detect_repetitive_tool_loop
+        from app.services.tool_mapping import ClientType
+
+        msgs = [
+            {"role": "system", "content": "You are a coding assistant."},
+            {"role": "user", "content": "Find the helm scripts."},
+        ]
+        for i in range(3):
+            msgs.append({
+                "role": "assistant",
+                "content": "<list_files>\n<path>Tools/scripts</path>\n</list_files>",
+            })
+            msgs.append({
+                "role": "user",
+                "content": "[Tool Result]\nbuild.sh\nstart.sh",
+            })
+
+        hint = detect_repetitive_tool_loop(msgs, "test", ClientType.ROO_CODE)
+        assert hint is not None
+        assert "write_to_file" not in hint, (
+            f"list_files loop must get the search hint, not the write hint.\nGot: {hint!r}"
+        )
+
+    def test_search_loop_below_threshold_no_hint(self):
+        """2 identical search_files calls must not trigger the hint (threshold=3)."""
+        from app.services.loop_detection import detect_repetitive_tool_loop
+        from app.services.tool_mapping import ClientType
+
+        msgs = self._build_search_loop_history("search_files", ".", repeats=2)
+        hint = detect_repetitive_tool_loop(msgs, "test", ClientType.ROO_CODE)
+        assert hint is None, (
+            f"Hint must not fire below threshold (2 calls < 3). Got: {hint!r}"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # FIX v1.6.7: validate_apply_diff_completeness
 # File: app/services/tool_call_fixups.py
 #
@@ -955,6 +1124,151 @@ class TestValidateApplyDiffCompleteness:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# FIX v1.6.22: Unified diff → SEARCH/REPLACE conversion
+# File: app/services/tool_call_fixups.py
+#
+# The model consistently outputs unified diff format (--- a/file / @@ -1 +1 @@)
+# inside apply_diff when the user message contains a unified diff.  Instead of
+# dropping these, the proxy converts them to Roo Code SEARCH/REPLACE format.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestUnifiedDiffConversion:
+
+    def _make_tc(self, diff: str, name: str = "apply_diff") -> list:
+        return [{
+            "id": "call_test",
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": json.dumps({"path": "app.py", "diff": diff}),
+            },
+        }]
+
+    def test_simple_unified_diff_converted(self):
+        """
+        A minimal unified diff is converted to SEARCH/REPLACE and NOT dropped.
+
+        FAILS before fix: diff missing >>>>>>> REPLACE → dropped.
+        PASSES after fix: unified diff detected and converted.
+        """
+        from app.services.tool_call_fixups import validate_apply_diff_completeness
+
+        diff = "@@ -1 +1 @@\n-pritn('hello')\n+print('hello')\n"
+        result = validate_apply_diff_completeness(self._make_tc(diff), "test")
+
+        assert len(result) == 1, "Unified diff must be converted, not dropped"
+        args = json.loads(result[0]["function"]["arguments"])
+        converted = args["diff"]
+        assert "<<<<<<< SEARCH" in converted
+        assert "=======" in converted
+        assert ">>>>>>> REPLACE" in converted
+        assert "pritn('hello')" in converted
+        assert "print('hello')" in converted
+
+    def test_git_diff_headers_stripped(self):
+        """The --- a/ and +++ b/ header lines must not appear in the output."""
+        from app.services.tool_call_fixups import validate_apply_diff_completeness
+
+        diff = (
+            "--- a/app.py\n"
+            "+++ b/app.py\n"
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            "+new\n"
+        )
+        result = validate_apply_diff_completeness(self._make_tc(diff), "test")
+        assert len(result) == 1
+        args = json.loads(result[0]["function"]["arguments"])
+        converted = args["diff"]
+        assert "--- a/" not in converted
+        assert "+++ b/" not in converted
+        assert "old" in converted
+        assert "new" in converted
+
+    def test_context_lines_in_both_halves(self):
+        """Context lines (no +/- prefix) must appear in both SEARCH and REPLACE."""
+        from app.services.tool_call_fixups import validate_apply_diff_completeness
+
+        diff = (
+            "@@ -1,3 +1,3 @@\n"
+            " def foo():\n"
+            "-    return 1\n"
+            "+    return 2\n"
+            " # end\n"
+        )
+        result = validate_apply_diff_completeness(self._make_tc(diff), "test")
+        assert len(result) == 1
+        args = json.loads(result[0]["function"]["arguments"])
+        converted = args["diff"]
+        # Both halves must contain context lines
+        search_part = converted.split("=======")[0]
+        replace_part = converted.split("=======")[1]
+        assert "def foo():" in search_part
+        assert "def foo():" in replace_part
+        assert "# end" in search_part
+        assert "# end" in replace_part
+
+    def test_multiple_hunks_produce_multiple_blocks(self):
+        """Multiple @@ hunks become multiple SEARCH/REPLACE blocks."""
+        from app.services.tool_call_fixups import validate_apply_diff_completeness
+
+        diff = (
+            "@@ -1 +1 @@\n"
+            "-old_a\n"
+            "+new_a\n"
+            "@@ -10 +10 @@\n"
+            "-old_b\n"
+            "+new_b\n"
+        )
+        result = validate_apply_diff_completeness(self._make_tc(diff), "test")
+        assert len(result) == 1
+        args = json.loads(result[0]["function"]["arguments"])
+        converted = args["diff"]
+        assert converted.count("<<<<<<< SEARCH") == 2
+        assert converted.count(">>>>>>> REPLACE") == 2
+
+    def test_non_unified_corrupt_diff_still_dropped(self):
+        """
+        A diff that has neither >>>>>>> REPLACE nor @@ headers is still dropped.
+        (Truly corrupt/truncated output with no recoverable structure.)
+        """
+        from app.services.tool_call_fixups import validate_apply_diff_completeness
+
+        diff = "<<<<<<< SEARCH\nold line\n=======\nnew line\n"  # missing REPLACE
+        result = validate_apply_diff_completeness(self._make_tc(diff), "test")
+        assert len(result) == 0, "Corrupt diff without @@ headers must still be dropped"
+
+    def test_already_correct_diff_unchanged(self):
+        """A diff already in SEARCH/REPLACE format must pass through unchanged."""
+        from app.services.tool_call_fixups import validate_apply_diff_completeness
+
+        diff = "<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE"
+        result = validate_apply_diff_completeness(self._make_tc(diff), "test")
+        assert len(result) == 1
+        args = json.loads(result[0]["function"]["arguments"])
+        assert args["diff"] == diff  # unchanged
+
+    def test_bare_at_at_hunk_header_converted(self):
+        """
+        Some models emit a bare '@@' line (without -line,count +line,count coordinates).
+        This minimal form must also trigger the unified diff converter.
+
+        Reproduces: model output '<diff>\\n@@\\n-old\\n+new\\n</diff>'
+        """
+        from app.services.tool_call_fixups import validate_apply_diff_completeness
+
+        diff = '@@\n-  "include": ["src"]\n+  "include": ["src/**/*"]\n'
+        result = validate_apply_diff_completeness(self._make_tc(diff), "test")
+        assert len(result) == 1, "Bare @@ hunk header must be converted, not dropped"
+        args = json.loads(result[0]["function"]["arguments"])
+        converted = args["diff"]
+        assert "<<<<<<< SEARCH" in converted
+        assert ">>>>>>> REPLACE" in converted
+        assert '"include": ["src"]' in converted
+        assert '"include": ["src/**/*"]' in converted
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # ask_followup_question loop detection (v1.6.11)
 #
 # Roo Code sends a genuine user message after each answer, resetting the
@@ -1054,3 +1368,521 @@ class TestAskFollowupLoop:
         assert result is None, (
             "Old ask_followup_question calls outside the window must not trigger the hint."
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX v1.6.18: _remap_args_to_schema AttributeError for non-dict arguments
+# File: app/services/tool_mapping.py
+#
+# When a tool call has no arguments (e.g. <list_namespaces></list_namespaces>),
+# the XML parser sets arguments to '""'. json.loads('""') returns "" (a str),
+# not {} (a dict). _remap_args_to_schema then crashes:
+#   AttributeError: 'str' object has no attribute 'items'
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestRemapArgsNonDict:
+
+    def _make_tc(self, name: str, arguments: str) -> list:
+        return [{
+            "id": "call_test",
+            "type": "function",
+            "function": {"name": name, "arguments": arguments},
+        }]
+
+    def _list_namespaces_tool(self):
+        return _tool(
+            "list_namespaces", "List Kubernetes namespaces",
+            {"prefix": {"type": "string"}}, [],
+        )
+
+    def test_empty_string_args_does_not_crash(self):
+        """
+        Tool call with arguments='""' (JSON-encoded empty string, not object)
+        must not raise AttributeError in _remap_args_to_schema.
+
+        Reproduces the 500 error seen in prod logs (2026-04-16 09:18:32):
+          <list_namespaces></list_namespaces> → arguments='""' → str.items() crash
+
+        FAILS before fix: json.loads('""') = "" → "".items() → AttributeError
+        PASSES after fix: isinstance(args, dict) check skips remapping for non-dict
+        """
+        from app.services.tool_mapping import _remap_args_to_schema
+        tools = [self._list_namespaces_tool()]
+        tc = self._make_tc("list_namespaces", '""')
+        result = _remap_args_to_schema(tc, tools, "test")
+        assert result[0]["function"]["name"] == "list_namespaces", (
+            "Tool call must be returned unchanged when args is not a dict."
+        )
+
+    def test_null_args_does_not_crash(self):
+        """arguments='null' → json.loads → None (not dict) → must skip remapping."""
+        from app.services.tool_mapping import _remap_args_to_schema
+        tools = [self._list_namespaces_tool()]
+        tc = self._make_tc("list_namespaces", "null")
+        result = _remap_args_to_schema(tc, tools, "test")
+        assert result[0]["function"]["name"] == "list_namespaces"
+
+    def test_list_args_does_not_crash(self):
+        """arguments='[]' → json.loads → [] (list, not dict) → must skip remapping."""
+        from app.services.tool_mapping import _remap_args_to_schema
+        tools = [self._list_namespaces_tool()]
+        tc = self._make_tc("list_namespaces", "[]")
+        result = _remap_args_to_schema(tc, tools, "test")
+        assert result[0]["function"]["name"] == "list_namespaces"
+
+    def test_normal_dict_args_still_remapped(self):
+        """Normal dict args must still be remapped correctly after the fix."""
+        from app.services.tool_mapping import _remap_args_to_schema
+        tools = [_tool(
+            "write_to_file", "Write file",
+            {"path": {"type": "string"}, "content": {"type": "string"}},
+            ["path", "content"],
+        )]
+        tc = self._make_tc("write_to_file", json.dumps({"path": "foo.py", "content": "hi"}))
+        result = _remap_args_to_schema(tc, tools, "test")
+        args = json.loads(result[0]["function"]["arguments"])
+        assert "path" in args and args["path"] == "foo.py"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX v1.6.19: Loop detection reads OpenAI-format tool_calls in history
+# File: app/services/loop_detection.py
+#
+# When the model repeatedly calls write_to_file on the same path, the
+# conversation history contains assistant messages with OpenAI-format
+# tool_calls (as returned by toolproxy) — NOT XML in content.
+# Previously _extract_tool_call_key only checked 'content' → loop invisible.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestLoopDetectionOpenAIFormat:
+
+    def _build_write_loop_history(self, path: str, repeats: int, content_varies: bool = True) -> list:
+        """
+        Build a normalized history where write_to_file was called N times on the
+        same path using OpenAI-format tool_calls (as toolproxy returns them).
+        """
+        msgs = [
+            {"role": "system", "content": "You are a coding assistant."},
+            {"role": "user", "content": "Fix the Windows batch script."},
+        ]
+        for i in range(repeats):
+            call_id = f"call_write_{i:02d}"
+            content_val = f"@echo off\n:: version {i}\ncall tool.bat\n" if content_varies else "@echo off\ncall tool.bat\n"
+            msgs.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "write_to_file",
+                        "arguments": json.dumps({"path": path, "content": content_val}),
+                    },
+                }],
+            })
+            msgs.append({
+                "role": "user",
+                "content": f"[Tool Result]\nThe content was successfully saved to {path}.",
+            })
+        return msgs
+
+    def test_openai_format_write_loop_detected(self):
+        """
+        write_to_file called 3× on the same path via OpenAI-format tool_calls
+        must trigger detect_repetitive_tool_loop.
+
+        Reproduces the create-topics.bat write loop (2026-04-16 11:10–11:17) where
+        the model alternated kafka-topics.bat/.sh content but always wrote the same path.
+
+        FAILS before fix: _extract_tool_call_key only checked 'content' field →
+                          OpenAI-format tool_calls invisible → loop not detected
+        PASSES after fix: _extract_key_from_message also checks 'tool_calls' field
+        """
+        from app.services.loop_detection import detect_repetitive_tool_loop
+        from app.services.tool_mapping import ClientType
+
+        path = "Tools/kafka/windows/create-topics.bat"
+        msgs = self._build_write_loop_history(path, repeats=3)
+        hint = detect_repetitive_tool_loop(msgs, "test", ClientType.ROO_CODE)
+
+        assert hint is not None, (
+            "detect_repetitive_tool_loop must fire after 3 consecutive write_to_file "
+            "calls using OpenAI-format tool_calls in history.\n"
+            "FAIL: loop detection was only checking 'content' field, missing tool_calls."
+        )
+
+    def test_below_threshold_no_detection(self):
+        """2 consecutive OpenAI-format calls on same path must not trigger (threshold=3)."""
+        from app.services.loop_detection import detect_repetitive_tool_loop
+        from app.services.tool_mapping import ClientType
+
+        msgs = self._build_write_loop_history("Tools/kafka/windows/create-topics.bat", repeats=2)
+        hint = detect_repetitive_tool_loop(msgs, "test", ClientType.ROO_CODE)
+        assert hint is None, f"Must not fire below threshold. Got: {hint!r}"
+
+    def test_different_paths_do_not_trigger(self):
+        """Alternating write_to_file on different paths must not trigger."""
+        from app.services.loop_detection import detect_repetitive_tool_loop
+        from app.services.tool_mapping import ClientType
+
+        msgs = [
+            {"role": "system", "content": "You are a coding assistant."},
+            {"role": "user", "content": "Fix the scripts."},
+        ]
+        for i, path in enumerate(["script_a.bat", "script_b.bat", "script_a.bat"]):
+            call_id = f"call_{i:02d}"
+            msgs.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "write_to_file",
+                        "arguments": json.dumps({"path": path, "content": "content"}),
+                    },
+                }],
+            })
+            msgs.append({"role": "user", "content": f"[Tool Result]\nSaved {path}."})
+
+        hint = detect_repetitive_tool_loop(msgs, "test", ClientType.ROO_CODE)
+        assert hint is None, f"Different paths must not trigger loop. Got: {hint!r}"
+
+    def test_mixed_xml_and_openai_format_detected(self):
+        """
+        Mix of XML-format and OpenAI-format tool_calls on same path must also
+        trigger once threshold is reached.
+        """
+        from app.services.loop_detection import detect_repetitive_tool_loop
+        from app.services.tool_mapping import ClientType
+
+        path = "Tools/kafka/windows/create-topics.bat"
+        msgs = [
+            {"role": "system", "content": "You are a coding assistant."},
+            {"role": "user", "content": "Fix the script."},
+            # First call: XML format in content
+            {"role": "assistant", "content": f"<write_to_file>\n<path>{path}</path>\n<content>v1</content>\n</write_to_file>"},
+            {"role": "user", "content": "[Tool Result]\nSaved."},
+            # Second call: OpenAI format
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "c2", "type": "function", "function": {"name": "write_to_file", "arguments": json.dumps({"path": path, "content": "v2"})}}]},
+            {"role": "user", "content": "[Tool Result]\nSaved."},
+            # Third call: OpenAI format again
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "c3", "type": "function", "function": {"name": "write_to_file", "arguments": json.dumps({"path": path, "content": "v3"})}}]},
+            {"role": "user", "content": "[Tool Result]\nSaved."},
+        ]
+        hint = detect_repetitive_tool_loop(msgs, "test", ClientType.ROO_CODE)
+        assert hint is not None, (
+            "Mixed XML/OpenAI format write_to_file calls on same path must trigger loop detection."
+        )
+
+    def test_trailing_genuine_user_message_does_not_reset_streak(self):
+        """
+        When the history ends with a genuine user message (e.g. "still broken,
+        please fix it"), the repetitive-loop streak built from prior assistant
+        calls must NOT be reset.
+
+        Reproduces the production scenario: 3× write_to_file → [success] →
+        genuine user follow-up → toolproxy call #4.  The trailing message is
+        the current prompt (unresponded); excluding it from the scan preserves
+        the streak so the correction hint fires.
+
+        FAILS before fix (v1.6.20): genuine user message at end resets consecutive=0.
+        PASSES after fix: trailing genuine user message is excluded from scan.
+        """
+        from app.services.loop_detection import detect_repetitive_tool_loop
+        from app.services.tool_mapping import ClientType
+
+        path = "Tools/kafka/windows/create-topics.bat"
+        msgs = self._build_write_loop_history(path, repeats=3)
+        # Append the current user prompt — exactly as toolproxy receives it
+        msgs.append({"role": "user", "content": "The script still doesn't work. Please fix it."})
+
+        hint = detect_repetitive_tool_loop(msgs, "test", ClientType.ROO_CODE)
+        assert hint is not None, (
+            "detect_repetitive_tool_loop must fire even when history ends with a genuine "
+            "user message (the current prompt). The trailing message must be excluded from "
+            "the scan so a 'please try again' doesn't erase the 3-write streak.\n"
+            "FAIL: consecutive counter was reset by the trailing user message."
+        )
+
+    def test_new_genuine_user_turn_in_middle_resets_streak(self):
+        """
+        A genuine user message in the MIDDLE of the history (not trailing) must
+        still reset the consecutive counter — it represents a real task boundary.
+        """
+        from app.services.loop_detection import detect_repetitive_tool_loop
+        from app.services.tool_mapping import ClientType
+
+        path = "script.bat"
+        msgs = [
+            {"role": "system", "content": "You are a coding assistant."},
+            {"role": "user", "content": "Fix the script."},
+            # 2 writes before the task boundary
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "write_to_file", "arguments": json.dumps({"path": path, "content": "v1"})}}]},
+            {"role": "user", "content": "[Tool Result]\nSaved."},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "c2", "type": "function", "function": {"name": "write_to_file", "arguments": json.dumps({"path": path, "content": "v2"})}}]},
+            {"role": "user", "content": "[Tool Result]\nSaved."},
+            # Genuine user message mid-history — resets streak
+            {"role": "user", "content": "Actually, write a different file instead."},
+            # 2 writes after the task boundary (below threshold)
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "c3", "type": "function", "function": {"name": "write_to_file", "arguments": json.dumps({"path": path, "content": "v3"})}}]},
+            {"role": "user", "content": "[Tool Result]\nSaved."},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "c4", "type": "function", "function": {"name": "write_to_file", "arguments": json.dumps({"path": path, "content": "v4"})}}]},
+            {"role": "user", "content": "[Tool Result]\nSaved."},
+        ]
+        hint = detect_repetitive_tool_loop(msgs, "test", ClientType.ROO_CODE)
+        assert hint is None, (
+            "A genuine user message in the MIDDLE of history must reset the streak. "
+            "Only 2 writes after the reset — below threshold=3. Must not fire."
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX v1.6.19: Priming teaches write_to_file → attempt_completion pattern
+# File: app/services/priming.py
+#
+# A new static priming sequence shows: after a successful write_to_file,
+# call attempt_completion. Prevents the model from rewriting the same file
+# in a loop (observed: create-topics.bat written 6+ times, 2026-04-16).
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestPrimingWriteCompletionSequence:
+
+    def _get_priming_messages(self):
+        from app.services.priming import inject_priming
+        from app.services.tool_mapping import ClientType
+        base = [{"role": "user", "content": "Do something."}]
+        return inject_priming(base, DEFAULT_TOOLS, client_type=ClientType("roo_code"))
+
+    def test_priming_contains_write_then_attempt_completion(self):
+        """
+        Priming must contain a sequence:
+          assistant: write_to_file
+          user:      [Tool Result] successfully saved
+          assistant: attempt_completion
+
+        Teaches the model: after a successful write, stop — do not keep rewriting.
+
+        FAILS before fix: no such sequence existed in static priming
+        PASSES after fix: new three-turn sequence added to _STATIC_PRIMING_SEQUENCES
+        """
+        messages = self._get_priming_messages()
+
+        found = False
+        for i, msg in enumerate(messages):
+            if (msg.get("role") == "assistant" and
+                    "write_to_file" in msg.get("content", "") and
+                    i + 2 < len(messages)):
+                next_user = messages[i + 1]
+                next_asst = messages[i + 2]
+                if (next_user.get("role") == "user" and
+                        "successfully" in next_user.get("content", "").lower() and
+                        next_asst.get("role") == "assistant" and
+                        "attempt_completion" in next_asst.get("content", "")):
+                    found = True
+                    break
+
+        assert found, (
+            "Priming must contain: write_to_file → [Tool Result] success → attempt_completion.\n"
+            "This sequence teaches the model to stop after a successful write.\n"
+            "Without it the model rewrites the same file in a loop."
+        )
+
+    def test_priming_write_completion_sequence_uses_bat_file(self):
+        """
+        The new priming sequence must use a .bat file example — specifically relevant
+        to the Windows script loop bug (create-topics.bat, 2026-04-16).
+        """
+        messages = self._get_priming_messages()
+        bat_in_priming = any(
+            ".bat" in msg.get("content", "")
+            for msg in messages
+            if msg.get("role") == "assistant"
+        )
+        assert bat_in_priming, (
+            "Priming must include a .bat file example for the write→completion sequence. "
+            "This directly addresses the Windows script loop pattern."
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX v1.6.21: Priming requires-gating — only inject sequences for tools that
+# are present in the session.  Saves tokens and avoids teaching the model
+# formats for tools it cannot use.  Also adds apply_diff SEARCH/REPLACE example.
+# File: app/services/priming.py
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestPrimingRequiresGating:
+
+    def _make_tools(self, *names):
+        return [_tool(n, f"desc {n}", {"path": {"type": "string"}}, ["path"]) for n in names]
+
+    def test_apply_diff_sequence_injected_when_tool_present(self):
+        """
+        apply_diff priming sequence must be injected when apply_diff is in tools.
+        """
+        from app.services.priming import inject_priming
+        from app.services.tool_mapping import ClientType
+
+        tools = self._make_tools("apply_diff", "write_to_file", "attempt_completion")
+        msgs = inject_priming([{"role": "user", "content": "Fix it."}], tools, ClientType.ROO_CODE)
+
+        has_search_replace = any(
+            "<<<<<<< SEARCH" in msg.get("content", "")
+            for msg in msgs if msg.get("role") == "assistant"
+        )
+        assert has_search_replace, (
+            "apply_diff priming must inject a SEARCH/REPLACE example when apply_diff is in tools."
+        )
+
+    def test_apply_diff_sequence_skipped_when_tool_absent(self):
+        """
+        apply_diff priming sequence must NOT be injected when apply_diff is NOT in tools.
+        Token cost is avoided for sessions that don't use apply_diff.
+        """
+        from app.services.priming import inject_priming
+        from app.services.tool_mapping import ClientType
+
+        tools = self._make_tools("read_file", "write_to_file", "attempt_completion")
+        msgs = inject_priming([{"role": "user", "content": "Fix it."}], tools, ClientType.ROO_CODE)
+
+        has_search_replace = any(
+            "<<<<<<< SEARCH" in msg.get("content", "")
+            for msg in msgs if msg.get("role") == "assistant"
+        )
+        assert not has_search_replace, (
+            "apply_diff priming must NOT be injected when apply_diff is absent from tools. "
+            "Sessions without apply_diff should not pay the token cost."
+        )
+
+    def test_execute_command_sequence_skipped_when_absent(self):
+        """
+        execute_command (rename/mv) priming must be skipped when execute_command is not in tools.
+        """
+        from app.services.priming import inject_priming
+        from app.services.tool_mapping import ClientType
+
+        tools = self._make_tools("read_file", "write_to_file")
+        msgs = inject_priming([{"role": "user", "content": "Do something."}], tools, ClientType.ROO_CODE)
+
+        has_mv = any(
+            "mv old_folder" in msg.get("content", "")
+            for msg in msgs if msg.get("role") == "assistant"
+        )
+        assert not has_mv, (
+            "execute_command priming must be skipped when execute_command is not in tools."
+        )
+
+    def test_token_savings_minimal_toolset(self):
+        """
+        A session with only read_file + attempt_completion must receive fewer
+        priming messages than a session with the full Roo Code tool set.
+        """
+        from app.services.priming import inject_priming
+        from app.services.tool_mapping import ClientType
+
+        base = [{"role": "user", "content": "Check the file."}]
+        minimal_tools = self._make_tools("read_file", "attempt_completion")
+        full_tools = self._make_tools(
+            "read_file", "write_to_file", "apply_diff",
+            "execute_command", "attempt_completion",
+        )
+
+        minimal_msgs = inject_priming(base[:], minimal_tools, ClientType.ROO_CODE)
+        full_msgs = inject_priming(base[:], full_tools, ClientType.ROO_CODE)
+
+        assert len(minimal_msgs) < len(full_msgs), (
+            f"Minimal tool set should produce fewer priming messages than full set. "
+            f"Got minimal={len(minimal_msgs)} vs full={len(full_msgs)}."
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX v1.6.17: use_mcp_tool hint injection for raw XML with tools=0
+# File: app/main.py
+#
+# When a generic client sends requests with no tool definitions (tools=0),
+# the model outputs raw XML like <list_datasources>. Toolproxy returned this
+# as plain text with no hint, causing the model to retry with different formats.
+# Fix: detect raw XML tags in content when tools=0 and append a hint.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestMcpHintInjection:
+
+    def test_raw_xml_with_no_tools_injects_hint(self, client):
+        """
+        Model outputs raw <list_datasources>...</list_datasources> with tools=[].
+        Response content must contain the use_mcp_tool format hint.
+
+        Reproduces the grafana-mcp loop (2026-04-16 08:06–08:09) where the
+        model oscillated between raw XML and use_mcp_tool format.
+        """
+        from unittest.mock import AsyncMock, patch
+        import app.main as main_module
+        from tests.conftest import llm_response
+
+        raw_xml = llm_response("<list_datasources>\n<type>prometheus</type>\n</list_datasources>")
+
+        with patch.object(main_module, "upstream_client") as mock_uc:
+            mock_uc.chat_completion = AsyncMock(return_value=raw_xml)
+            resp = client.post("/v1/chat/completions", json={
+                "model": "oracle-llm",
+                "messages": [{"role": "user", "content": "List Prometheus datasources."}],
+                "tools": [],
+            })
+
+        assert resp.status_code == 200, resp.text
+        msg = resp.json()["choices"][0]["message"]
+        content = msg.get("content") or ""
+
+        assert "use_mcp_tool" in content, (
+            "Raw XML with tools=0 must trigger use_mcp_tool hint injection.\n"
+            f"Content: {content[:300]!r}"
+        )
+        assert not (msg.get("tool_calls")), (
+            "No tool_calls should be present — this is a text hint, not a parsed tool call."
+        )
+
+    def test_raw_xml_with_tools_defined_no_hint(self, client):
+        """When tools ARE defined, XML is parsed normally — no hint injected."""
+        from unittest.mock import AsyncMock, patch
+        import app.main as main_module
+        from tests.conftest import llm_response, TOOL_READ_FILE, TOOL_ATTEMPT_COMPLETION
+
+        with patch.object(main_module, "upstream_client") as mock_uc:
+            mock_uc.chat_completion = AsyncMock(
+                return_value=llm_response("<read_file>\n<path>README.md</path>\n</read_file>")
+            )
+            resp = client.post("/v1/chat/completions", json={
+                "model": "oracle-llm",
+                "messages": [{"role": "user", "content": "Read the README."}],
+                "tools": [TOOL_READ_FILE, TOOL_ATTEMPT_COMPLETION],
+            })
+
+        assert resp.status_code == 200, resp.text
+        msg = resp.json()["choices"][0]["message"]
+        tool_calls = msg.get("tool_calls") or []
+        content = msg.get("content") or ""
+
+        assert tool_calls, "XML with tools defined must be parsed as a tool call"
+        assert "use_mcp_tool" not in content, "Hint must not appear when XML was parsed correctly"
+
+    def test_plain_text_with_no_tools_no_hint(self, client):
+        """Plain text response (no XML) with tools=[] must not trigger hint."""
+        from unittest.mock import AsyncMock, patch
+        import app.main as main_module
+        from tests.conftest import llm_response
+
+        with patch.object(main_module, "upstream_client") as mock_uc:
+            mock_uc.chat_completion = AsyncMock(
+                return_value=llm_response("The Prometheus datasource UID is abc123.")
+            )
+            resp = client.post("/v1/chat/completions", json={
+                "model": "oracle-llm",
+                "messages": [{"role": "user", "content": "What is the Prometheus UID?"}],
+                "tools": [],
+            })
+
+        assert resp.status_code == 200, resp.text
+        content = resp.json()["choices"][0]["message"].get("content") or ""
+        assert "use_mcp_tool" not in content, "Hint must not appear for plain text responses"

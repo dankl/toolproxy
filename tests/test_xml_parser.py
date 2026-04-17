@@ -13,6 +13,7 @@ import pytest
 
 from app.services.xml_parser import (
     convert_xml_tool_calls_to_openai_format,
+    extract_mcp_tool_calls,
     extract_xml_tool_calls,
     fix_xml_string,
     xml_element_to_dict,
@@ -436,3 +437,107 @@ class TestXmlElementToDict:
         assert isinstance(result, dict)
         assert result["value"] == "content"
         assert result["name"] == "foo.py"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# extract_mcp_tool_calls
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestExtractMcpToolCalls:
+    """Tests for Roo Code XML-mode <use_mcp_tool> parsing."""
+
+    _BASIC = (
+        "<use_mcp_tool>\n"
+        "<server_name>grafana-mcp</server_name>\n"
+        "<tool_name>list_datasources</tool_name>\n"
+        '<arguments>\n{"type": "loki"}\n</arguments>\n'
+        "</use_mcp_tool>"
+    )
+
+    def test_basic_parse(self):
+        calls, remaining = extract_mcp_tool_calls(self._BASIC)
+        assert len(calls) == 1
+        assert calls[0].name == "grafana-mcp__list_datasources"
+        assert calls[0].arguments == {"type": "loki"}
+        assert remaining == ""
+
+    def test_tool_id_generated(self):
+        calls, _ = extract_mcp_tool_calls(self._BASIC)
+        assert calls[0].id.startswith("call_")
+
+    def test_no_server_name_uses_tool_name_only(self):
+        xml = (
+            "<use_mcp_tool>\n"
+            "<tool_name>query_logs</tool_name>\n"
+            "<arguments>{}</arguments>\n"
+            "</use_mcp_tool>"
+        )
+        calls, _ = extract_mcp_tool_calls(xml)
+        assert len(calls) == 1
+        assert calls[0].name == "query_logs"
+
+    def test_empty_arguments_defaults_to_empty_dict(self):
+        xml = (
+            "<use_mcp_tool>\n"
+            "<server_name>my-mcp</server_name>\n"
+            "<tool_name>ping</tool_name>\n"
+            "<arguments></arguments>\n"
+            "</use_mcp_tool>"
+        )
+        calls, _ = extract_mcp_tool_calls(xml)
+        assert calls[0].arguments == {}
+
+    def test_preamble_text_preserved_in_remaining(self):
+        content = "Sure, let me check.\n" + self._BASIC
+        calls, remaining = extract_mcp_tool_calls(content)
+        assert len(calls) == 1
+        assert "Sure, let me check." in remaining
+
+    def test_xml_block_removed_from_remaining(self):
+        calls, remaining = extract_mcp_tool_calls(self._BASIC)
+        assert "<use_mcp_tool>" not in remaining
+
+    def test_no_mcp_tag_returns_unchanged(self):
+        content = "Just a normal text response."
+        calls, remaining = extract_mcp_tool_calls(content)
+        assert calls == []
+        assert remaining == content
+
+    def test_empty_content_returns_empty(self):
+        calls, remaining = extract_mcp_tool_calls("")
+        assert calls == []
+        assert remaining == ""
+
+    def test_missing_tool_name_skipped(self):
+        xml = (
+            "<use_mcp_tool>\n"
+            "<server_name>grafana-mcp</server_name>\n"
+            "<arguments>{}</arguments>\n"
+            "</use_mcp_tool>"
+        )
+        calls, _ = extract_mcp_tool_calls(xml)
+        assert calls == []
+
+    def test_complex_json_arguments(self):
+        xml = (
+            "<use_mcp_tool>\n"
+            "<server_name>grafana-mcp</server_name>\n"
+            "<tool_name>query_loki_logs</tool_name>\n"
+            '<arguments>{"datasourceUid": "abc123", "logql": "{pod=\\"my-pod\\"}", "limit": 50}</arguments>\n'
+            "</use_mcp_tool>"
+        )
+        calls, _ = extract_mcp_tool_calls(xml)
+        assert len(calls) == 1
+        assert calls[0].name == "grafana-mcp__query_loki_logs"
+        assert calls[0].arguments["limit"] == 50
+        assert calls[0].arguments["datasourceUid"] == "abc123"
+
+    def test_convert_to_openai_format(self):
+        calls, _ = extract_mcp_tool_calls(self._BASIC)
+        openai_calls = convert_xml_tool_calls_to_openai_format(calls)
+        assert len(openai_calls) == 1
+        tc = openai_calls[0]
+        assert tc["type"] == "function"
+        assert tc["function"]["name"] == "grafana-mcp__list_datasources"
+        args = json.loads(tc["function"]["arguments"])
+        assert args == {"type": "loki"}

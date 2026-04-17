@@ -756,3 +756,221 @@ class TestTruncatedApplyDiffRescue:
             assert ">>>>>>> REPLACE" in diff, (
                 f"apply_diff diff missing REPLACE marker.\nDiff: {diff[:200]!r}"
             )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.6.14 — Search-loop hint is tool-aware + ONE CALL enforcement
+#
+# Observed in prod (2026-04-10): after 4× failed search_files, the model
+# received the write-tool hint ("use write_to_file") which made no sense for
+# a search operation. On the next turn it batched 14 tool calls at once.
+#
+# Fix 1: search tools get a dedicated hint ("item likely doesn't exist here,
+#         try a completely different approach").
+# Fix 2: all hints now include "CRITICAL: Always send exactly ONE tool call
+#         per response — never batch multiple calls."
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestSearchLoopHintLive:
+    """
+    Live E2E test: when search_files repeatedly returns no results, the model
+    must respond with a SINGLE tool call — not batch multiple calls.
+    Reproduces the 14-calls-at-once incident from 2026-04-10.
+    """
+
+    def _build_failed_search_history(self, repeats: int = 3) -> list:
+        """
+        Build a conversation where search_files was called N times on the same
+        path and found nothing each time — reproducing the helm-search scenario.
+        """
+        msgs = [SYSTEM_MSG]
+        msgs.append(user_msg("Find where 'helm upgrade' is called in this project."))
+        for i in range(repeats):
+            call_id = f"call_search_{i:02d}"
+            msgs.append(_assistant_tool_call(
+                "search_files",
+                {"path": ".", "regex": "helm upgrade"},
+                call_id,
+            ))
+            msgs.append(_tool_result("No matches found.", call_id))
+        msgs.append(user_msg("Please continue searching."))
+        return msgs
+
+    def test_search_loop_does_not_produce_batched_calls(self, live):
+        """
+        After 3× search_files with no results and the search-aware correction hint,
+        the model must respond with exactly ONE tool call — not batch multiple calls.
+
+        Regression: before fix, the write-tool hint caused the model to batch 14
+        calls at once (observed 2026-04-10 in production logs).
+        """
+        import os
+        msgs = self._build_failed_search_history(repeats=3)
+        model = os.environ.get("LIVE_MODEL", "openai/gpt-oss-120b")
+        resp = live.post("/v1/chat/completions", json={
+            "model": model,
+            "messages": msgs,
+            "tools": ROO_CODE_TOOLS,
+        })
+        assert resp.status_code == 200, resp.text
+        result = resp.json()
+        msg = result["choices"][0]["message"]
+        tool_calls = msg.get("tool_calls") or []
+
+        # toolproxy already trims to 1, but the point is the model should not
+        # be trying to batch — verify it didn't try (check raw content for XML batching)
+        content = msg.get("content") or ""
+        # Count top-level XML tool tags in the response (if any leaked through)
+        import re
+        xml_tags = re.findall(r"<([a-z_]+)>", content)
+        tool_names_in_content = [t for t in xml_tags if t in {
+            "search_files", "list_files", "read_file", "write_to_file",
+            "attempt_completion", "execute_command",
+        }]
+        assert len(tool_names_in_content) <= 1, (
+            f"Model produced multiple XML tool calls in a single response "
+            f"({len(tool_names_in_content)} tags found: {tool_names_in_content}).\n"
+            "The search-loop hint must include 'ONE tool call per response'.\n"
+            "Regression: 14-calls-at-once behaviour (2026-04-10)."
+        )
+
+        # Must produce exactly one tool call (toolproxy enforces this anyway)
+        assert len(tool_calls) == 1, (
+            f"Expected exactly 1 tool call, got {len(tool_calls)}.\n"
+            f"Tool calls: {[tc['function']['name'] for tc in tool_calls]}"
+        )
+
+    def test_search_loop_hint_leads_to_attempt_completion_or_different_tool(self, live):
+        """
+        After the search-loop correction hint, the model must either:
+        - call attempt_completion (report item not found)
+        - try a genuinely different search (different path, different tool)
+
+        It must NOT call search_files with the same path again.
+        """
+        import os
+        msgs = self._build_failed_search_history(repeats=3)
+        model = os.environ.get("LIVE_MODEL", "openai/gpt-oss-120b")
+        resp = live.post("/v1/chat/completions", json={
+            "model": model,
+            "messages": msgs,
+            "tools": ROO_CODE_TOOLS,
+        })
+        assert resp.status_code == 200, resp.text
+        name, args = parse_tool_call(resp.json())
+
+        if name == "search_files":
+            # Acceptable only if the path is different (genuinely exploring elsewhere)
+            assert args.get("path") != ".", (
+                "Model called search_files on the same path '.' again after correction hint.\n"
+                "The hint must cause the model to try a different path or give up."
+            )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.6.19 — write_to_file loop detection via OpenAI-format history
+#
+# Observed in prod (2026-04-16 11:10–11:17): model wrote create-topics.bat
+# 6+ times alternating kafka-topics.bat/.sh. Loop detection didn't fire
+# because history contained OpenAI-format tool_calls, not XML in content.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestWriteToFileLoopDetection:
+    """
+    Live E2E test: after write_to_file on the same file 3× in a row
+    (using OpenAI-format tool_calls in history), the loop correction hint
+    must fire and cause the model to stop rewriting.
+    """
+
+    _SCRIPT_PATH = "Tools/kafka/windows/create-topics.bat"
+
+    def _build_write_loop_history(self, repeats: int) -> list:
+        """
+        Build a history where write_to_file was called N times on the same path
+        using OpenAI-format tool_calls (as toolproxy returns them to Roo Code).
+        The content alternates between .bat and .sh script content to simulate
+        the exact oscillation pattern observed in production.
+        """
+        msgs = [
+            SYSTEM_MSG,
+            user_msg(
+                "Fix the Windows batch script to use the native kafka-topics.bat launcher "
+                "instead of the Linux shell script."
+            ),
+        ]
+        versions = [
+            "@echo off\nset KAFKA_TOPICS=%~dp0kafka\\bin\\windows\\kafka-topics.bat\ncall \"%KAFKA_TOPICS%\"\n",
+            "@echo off\nset KAFKA_TOPICS=%~dp0kafka/bin/kafka-topics.sh\nbash \"%KAFKA_TOPICS%\"\n",
+        ]
+        for i in range(repeats):
+            call_id = f"call_write_{i:02d}"
+            msgs.append(_assistant_tool_call(
+                "write_to_file",
+                {"path": self._SCRIPT_PATH, "content": versions[i % 2]},
+                call_id,
+            ))
+            msgs.append(_tool_result(
+                f"The content was successfully saved to {self._SCRIPT_PATH}.",
+                call_id,
+            ))
+        msgs.append(user_msg("The script still doesn't work. Please fix it."))
+        return msgs
+
+    def test_write_loop_hint_fires_after_three_writes(self, live):
+        """
+        After 3 consecutive write_to_file calls on the same path (via OpenAI-format
+        tool_calls in history), toolproxy must inject a loop correction hint.
+
+        The model should NOT keep rewriting the same file — it must either:
+          - call read_file to verify current state
+          - call attempt_completion if it believes the task is done
+          - try a genuinely different approach
+
+        Regression test for the create-topics.bat write loop (2026-04-16).
+        """
+        import os
+        msgs = self._build_write_loop_history(repeats=3)
+        model = os.environ.get("LIVE_MODEL", "openai/gpt-oss-120b")
+        resp = live.post("/v1/chat/completions", json={
+            "model": model,
+            "messages": msgs,
+            "tools": [TOOL_READ_FILE, TOOL_WRITE_TO_FILE, TOOL_EXECUTE_COMMAND, TOOL_ATTEMPT_COMPLETION],
+        })
+        assert resp.status_code == 200, resp.text
+        name, args = parse_tool_call(resp.json())
+
+        # After the loop correction hint, model must NOT rewrite the same file again
+        if name == "write_to_file":
+            # Acceptable only if writing a different file
+            assert args.get("path") != self._SCRIPT_PATH, (
+                f"Model called write_to_file on the same path '{self._SCRIPT_PATH}' again "
+                "after 3 consecutive writes.\n"
+                "Loop detection (v1.6.19) must have fired — check 'REPETITIVE LOOP' in logs.\n"
+                "Possible cause: OpenAI-format tool_calls in history not detected."
+            )
+
+    def test_write_loop_hint_suggests_read_or_completion(self, live):
+        """
+        After the write loop correction hint, the model should pivot to either
+        read_file (to verify state) or attempt_completion (done) rather than
+        repeating the oscillating write pattern.
+        """
+        import os
+        msgs = self._build_write_loop_history(repeats=3)
+        model = os.environ.get("LIVE_MODEL", "openai/gpt-oss-120b")
+        resp = live.post("/v1/chat/completions", json={
+            "model": model,
+            "messages": msgs,
+            "tools": [TOOL_READ_FILE, TOOL_WRITE_TO_FILE, TOOL_EXECUTE_COMMAND, TOOL_ATTEMPT_COMPLETION],
+        })
+        assert resp.status_code == 200, resp.text
+        name, _ = parse_tool_call(resp.json())
+
+        # Model must use a productive tool — not just keep writing the same file
+        productive_tools = {"read_file", "attempt_completion", "execute_command"}
+        if name == "write_to_file":
+            pass  # Only acceptable if path differs (tested above)
+        else:
+            assert name in productive_tools or name == "write_to_file", (
+                f"After write loop hint, expected a productive tool call. Got: {name!r}"
+            )

@@ -105,6 +105,8 @@ Beim ersten Turn (nur 1 User-Message) werden bis zu 3 synthetische Beispiel-Paar
 
 Tools werden in Priorität `read_file` → `write_to_file` → `attempt_completion` gewählt; fehlende werden durch andere verfügbare Tools ersetzt.
 
+**requires-Gating**: Jede Static Sequence ist mit den Tools annotiert, die sie voraussetzt. Eine Sequence wird nur injiziert wenn alle required Tools im `tools[]`-Array der Session vorhanden sind. Dadurch zahlen Minimal-Setups (z.B. nur `read_file` + `attempt_completion`) nicht den Token-Preis von `apply_diff`- oder `execute_command`-Beispielen. Das Priming skaliert proportional zum tatsächlich verfügbaren Tool-Set.
+
 ### 3. History-Normalisierung
 Damit das Modell in jedem Turn konsistentes XML sieht, werden eingehende Nachrichten normalisiert:
 
@@ -252,7 +254,7 @@ python3 -m pytest -v
 python3 -m pytest -v tests/test_roundtrip.py::TestXmlToolCalls
 ```
 
-Aktuelle Test-Coverage: 104 Unit-Tests gesamt (ohne Live-Tests).
+Aktuelle Test-Coverage: 192 Unit-Tests gesamt (ohne Live-Tests).
 
 **Live E2E-Tests** (laufen gegen echtes Modell, kein Mock):
 ```bash
@@ -271,7 +273,7 @@ Live-Tests decken ab: Write Guard, Repetitive-Loop-Detection, Timeout-Verhalten,
 
 `move_file` und `rename_file` sind Roo Code Builtins, die **nicht** im `tools[]`-Array erscheinen das Roo Code an die API schickt. Roo Code 3.51.1 dropped tool_calls für unbekannte Tools lautlos — kein Approval-Dialog, kein Fehler, nur "no assistant messages" nach Timeout.
 
-Der Proxy fängt das in Step 5b ab: `move_file(source=X, destination=Y)` → `execute_command(command="mv 'X' 'Y'")`. `execute_command` ist immer in `tools[]` → Roo Code zeigt den normalen Approval-Dialog. Funktioniert für Dateien und Ordner gleichermaßen.
+Der Proxy fängt das in Step 5c ab: `move_file(source=X, destination=Y)` → `execute_command(command="mv 'X' 'Y'")`. `execute_command` ist immer in `tools[]` → Roo Code zeigt den normalen Approval-Dialog. Funktioniert für Dateien und Ordner gleichermaßen.
 
 Das Priming lehrt das Modell direkt `execute_command` für Rename-Aufgaben zu nutzen; der Fallback greift wenn das Modell trotzdem `move_file` ausgibt.
 
@@ -286,6 +288,32 @@ Das Modell verwendet `apply_diff` mit ausschließlich `+`-Zeilen um neue Dateien
 Im Log sichtbar als:
 ```
 INFO  [abc12345] apply_diff all-additions on 'src/Main.java' → write_to_file
+```
+
+### apply_diff: Unified-Diff → SEARCH/REPLACE Konvertierung (implementiert)
+
+Das Modell gibt in `apply_diff` manchmal Unified-Diff-Format aus statt des von Roo Code erwarteten SEARCH/REPLACE-Formats — besonders wenn der User-Prompt selbst einen `--- a/file / +++ b/file / @@ ... @@`-Diff enthält. Der Proxy erkennt das und konvertiert automatisch:
+
+```
+@@ -1 +1 @@                    <<<<<<< SEARCH
+-pritn('hello')        →        pritn('hello')
++print('hello')                 =======
+                                print('hello')
+                                >>>>>>> REPLACE
+```
+
+Regeln:
+- `---`/`+++`-Headerzeilen werden übersprungen
+- Je `@@`-Hunk → ein SEARCH/REPLACE-Block (auch bare `@@` ohne Koordinaten)
+- `-`-Zeilen → SEARCH, `+`-Zeilen → REPLACE
+- Kontextzeilen (Leerzeichen-Prefix) erscheinen in beiden Hälften
+- Mehrere Hunks → mehrere SEARCH/REPLACE-Blöcke
+
+Wenn das Diff weder `>>>>>>> REPLACE` noch `@@`-Marker enthält (wirklich korrupt/abgeschnitten) → wird wie bisher gedroppt.
+
+Im Log sichtbar als:
+```
+INFO  [abc12345] Converted unified diff → SEARCH/REPLACE for apply_diff (142 chars)
 ```
 
 ### Mehrere Tool Calls pro Turn → Limit 1 (implementiert)
@@ -384,7 +412,9 @@ Zwei Detektoren, die einen CORRECTION-Hint in die letzte User-Message injizieren
 
 **Success-Loop** (Threshold 2, Fallback): 2+ aufeinanderfolgende erfolgreiche Write-Operationen ohne echten User-Turn → das Modell schreibt Duplikate. Hint: *"operation reported success N times but task may not be complete — verify with read_file or write_to_file"*.
 
-Ein echter User-Turn (keine `[Tool Result]`-Nachricht) setzt beide Zähler zurück.
+Ein echter User-Turn (keine `[Tool Result]`-Nachricht) setzt beide Zähler zurück — **außer** der letzte User-Turn ist der aktuelle Prompt (die Nachricht die gerade beantwortet wird). Der aktuelle Prompt wird aus dem Scan ausgeschlossen, damit ein „bitte nochmal versuchen" die aufgebaute Streak nicht zurücksetzt.
+
+**OpenAI-Format in History**: Roo Code schickt vergangene Runden als OpenAI-`tool_calls`-Objekte (nicht als XML in `content`). Die Loop-Detection erkennt beide Formate: XML im `content`-Feld (neue Turns) **und** `tool_calls`-Strukturen in der Conversation-History (vergangene Turns). Ohne diesen Fix wurden Roo-Code-Loops aus der History unsichtbar, und der Zähler blieb immer bei 0.
 
 Im Log sichtbar als:
 ```
@@ -416,6 +446,15 @@ Model output:  "follow_up": "Show output\nRestart server\nCheck config"
 Proxy fixes:   "follow_up": ["Show output", "Restart server", "Check config"]
 ```
 
+### Halluzinierter [Tool Result] nach write_to_file (implementiert)
+
+Nach einem erfolgreichen `write_to_file` schreibt das Modell gelegentlich einen gefakten `[Tool Result]`-Block in seinen eigenen Response, anstatt auf das echte Tool-Ergebnis von Roo Code zu warten — und ruft danach `write_to_file` erneut auf. Das erzeugt eine Endlos-Schleife mit wechselndem Dateiinhalt.
+
+Fix (Priming): Static Sequence im ROO_CODE-Priming zeigt das korrekte Muster:
+1. `write_to_file` aufrufen
+2. `[Tool Result]` kommt **immer aus der User-Turn** (nie selbst produzieren)
+3. Nach erfolgreichem Write → `attempt_completion` aufrufen (nicht nochmals schreiben)
+
 ### [Tool Result]-Halluzination bei gekürzten Dateien (implementiert)
 
 Roo Code kürzt große Dateien bei `read_file` mit einem spezifischen Format:
@@ -445,6 +484,28 @@ Im Log sichtbar als:
 WARNING [abc12345] WRITE GUARD: model tried to write markdown docs into 'application.yml' → replacing with ask_followup_question
 ```
 
+### Leere XML Tool-Calls (implementiert)
+
+Tool-Calls ohne Argumente (z.B. `<list_namespaces></list_namespaces>`) erzeugen nach dem XML-Parsing leere Strings statt leerer Dicts. `json.loads('""')` gibt `""` zurück — kein `dict`. Der Schema-Remap-Schritt rief dann `.items()` auf einem String auf und warf einen `AttributeError`.
+
+Fix: `_remap_args_to_schema` prüft jetzt nach dem JSON-Parse ob das Ergebnis wirklich ein `dict` ist; andernfalls wird der Tool-Call unverändert durchgereicht.
+
+### MCP-Tool-Hint bei fehlenden Tool-Definitionen (implementiert)
+
+Generic-Clients (kein `tools[]` im Request, z.B. direkte API-Zugriffe) erhalten keinen Tool-Context. Das Modell gibt dann manchmal rohes XML aus — ohne `<use_mcp_tool>`-Wrapper — und bekommt keine Rückmeldung warum nichts passiert.
+
+Fix: Wenn der Response rohes XML enthält **und** kein `tools[]` im Request war, hängt der Proxy automatisch einen Hinweis an:
+```
+[toolproxy] No tool definitions registered for this session.
+To call MCP tools, use the <use_mcp_tool> wrapper:
+<use_mcp_tool><server_name>SERVER</server_name><tool_name>TOOL</tool_name><arguments>{...}</arguments></use_mcp_tool>
+```
+
+Im Log sichtbar als:
+```
+INFO  [abc12345] Raw XML detected with tools=0 — injecting use_mcp_tool hint
+```
+
 ### Kein Retry bei Timeout (implementiert)
 
 Standard: `RETRY_ON_TIMEOUT=false`. Bei einem OCI-Timeout wird der Request nicht wiederholt — das Modell ist in dem Fall in der Regel hängengeblieben, kein transientes Netzwerkproblem. Mit dem alten Default (retry) wartete Roo Code bis zu 3 × 180s = 9 Minuten, bevor eine 502-Fehlermeldung kam. Jetzt kommt die 502 nach dem ersten Timeout.
@@ -468,12 +529,14 @@ INFO  [abc12345] XML alias: 'write_file' → 'write_to_file'               ← T
 INFO  [abc12345] Partial XML rescue → write_to_file('Plan.md')           ← Abgeschnittener Response
 INFO  [abc12345] JSON fallback: [Tool Call:] → read_file                 ← JSON-Fallback
 INFO  [abc12345] Convert move_file → execute_command: "mv 'src' 'dst'"    ← Rename/Move-Fix
-INFO  [abc12345] apply_diff all-additions on 'Main.java' → write_to_file ← Diff-Konvertierung
+INFO  [abc12345] apply_diff all-additions on 'Main.java' → write_to_file ← All-Additions-Konvertierung
+INFO  [abc12345] Converted unified diff → SEARCH/REPLACE for apply_diff (142 chars) ← Unified-Diff-Fix
 INFO  [abc12345] 3 tool calls → keeping only first ('write_to_file')     ← Multi-Call Limit
 INFO  [abc12345] Text response looks like file content → synthesizing write_to_file(...)  ← Text-Synthesis
 INFO  [abc12345] Text response → synthesizing attempt_completion fallback ← Synthesis-Fallback
 INFO  [abc12345] Schema remap write_to_file: 'path' → 'filePath'         ← Parameter-Remap (OpenCode)
 INFO  [abc12345] ask_followup_question: follow_up string → array (3 items) ← follow_up Fixup
+INFO  [abc12345] Raw XML detected with tools=0 — injecting use_mcp_tool hint ← MCP-Hint
 INFO  [abc12345] No tool calls found — returning text response           ← Reine Textantwort
 WARNING [abc12345] SUCCESS LOOP: 2 consecutive successful write operations — injecting stop hint
 WARNING [abc12345] REPETITIVE LOOP: tool='read_file' called 3× in a row — injecting correction hint

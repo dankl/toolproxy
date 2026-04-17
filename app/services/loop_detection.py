@@ -6,6 +6,7 @@ Two detectors:
 2. detect_repetitive_tool_loop — model calls the same tool with the same key argument
    repeatedly, regardless of success/failure (e.g. read_file on the same path 3× in a row).
 """
+import json
 import logging
 import re
 from typing import Dict, List, Optional
@@ -100,6 +101,12 @@ _XML_PATH_RE = re.compile(r"<(?:path|filePath)>([^<]{1,300})</(?:path|filePath)>
 # How many consecutive identical calls before we fire the hint.
 _REPETITIVE_THRESHOLD = 3
 
+# Tools that search/explore without modifying files — need a different hint
+# than write-type loops ("use write_to_file" makes no sense for search loops).
+_SEARCH_TOOLS = frozenset({
+    "search_files", "list_files", "read_file", "grep", "glob", "list",
+})
+
 
 def _extract_tool_call_key(content: str) -> Optional[str]:
     """
@@ -116,6 +123,37 @@ def _extract_tool_call_key(content: str) -> Optional[str]:
     return tool_name
 
 
+def _extract_key_from_message(msg: Dict) -> Optional[str]:
+    """
+    Extract a dedup key from an assistant message, checking both XML content
+    and OpenAI-format tool_calls (the latter is what toolproxy returns and what
+    appears in conversation history sent back by clients like Roo Code).
+    """
+    content = str(msg.get("content", "") or "")
+    if content:
+        key = _extract_tool_call_key(content)
+        if key:
+            return key
+
+    # Fall back to OpenAI-format tool_calls field
+    tool_calls = msg.get("tool_calls") or []
+    if not tool_calls:
+        return None
+    fn = tool_calls[0].get("function", {})
+    name = fn.get("name", "").lower()
+    if not name:
+        return None
+    try:
+        args = json.loads(fn.get("arguments", "{}"))
+        if isinstance(args, dict):
+            path = args.get("path") or args.get("filePath") or args.get("file_path")
+            if path:
+                return f"{name}|{path}"
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return name
+
+
 def detect_repetitive_tool_loop(
     messages: List[Dict],
     request_id: str = "",
@@ -127,13 +165,25 @@ def detect_repetitive_tool_loop(
 
     Scans the last 12 messages, looking at assistant turns only.
     Resets the counter when a genuine user message (non-tool-result) appears.
+
+    The last message is the current user prompt (not yet responded to).  If it
+    is a genuine user turn we exclude it from the scan so that a "please try
+    again" message doesn't reset a streak that was built up in prior rounds.
     """
     recent = messages[-12:] if len(messages) > 12 else messages
+
+    # Exclude the trailing genuine user message (the current prompt).
+    # It hasn't been acted on yet and must not break a consecutive streak.
+    scan = recent
+    if recent:
+        last = recent[-1]
+        if last.get("role") == "user" and "[Tool Result]" not in str(last.get("content", "")):
+            scan = recent[:-1]
 
     consecutive: int = 0
     last_key: Optional[str] = None
 
-    for msg in recent:
+    for msg in scan:
         role = msg.get("role", "")
         content = str(msg.get("content", ""))
 
@@ -147,7 +197,7 @@ def detect_repetitive_tool_loop(
         if role != "assistant":
             continue
 
-        key = _extract_tool_call_key(content)
+        key = _extract_key_from_message(msg)
         if key is None:
             # No tool call in this assistant turn — reset streak
             consecutive = 0
@@ -169,18 +219,32 @@ def detect_repetitive_tool_loop(
         f"[{request_id}] REPETITIVE LOOP: tool={tool_name!r} called {consecutive}× "
         f"in a row — injecting correction hint"
     )
+
+    _one_call = "CRITICAL: Always send exactly ONE tool call per response — never batch multiple calls."
+
+    if tool_name in _SEARCH_TOOLS:
+        # Search/read loop: the item probably doesn't exist here or needs a different strategy.
+        return (
+            f"STOP: You have called '{tool_name}' {consecutive} times in a row without finding what you need. "
+            "If the item was not found after multiple searches, it likely does not exist at this location. "
+            "Try a completely different approach: use a different tool, search a different path, "
+            "or call attempt_completion to report that the item could not be found. "
+            f"{_one_call}"
+        )
+
+    # Write/modify loop
     if client_type == ClientType.OPEN_CODE:
         return (
             f"STOP: You have called '{tool_name}' {consecutive} times in a row "
             "without making progress. Use write_to_file with the COMPLETE corrected "
             "content, or read_file to verify the current state first. "
-            "Do not repeat the same partial operation again."
+            f"Do not repeat the same partial operation again. {_one_call}"
         )
     return (
         f"STOP: You have called '{tool_name}' {consecutive} times in a row "
         "without making progress. Use write_to_file with the COMPLETE corrected "
         "content, or read_file to verify the current state first. "
-        "Do not repeat the same partial operation again."
+        f"Do not repeat the same partial operation again. {_one_call}"
     )
 
 

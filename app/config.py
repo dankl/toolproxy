@@ -45,6 +45,13 @@ class Settings(BaseSettings):
         default="/logs/toolproxy-audit.jsonl",
         description="Path for the anonymized audit log (JSON Lines). Empty string disables it.",
     )
+    log_redact_words: str = Field(
+        default="",
+        description=(
+            "Comma-separated list of words to redact from all log output (case-insensitive). "
+            "Each occurrence is replaced with 'xxx'. Example: daniel.klan,ProjectName,secret"
+        ),
+    )
 
 
 settings = Settings()
