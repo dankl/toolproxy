@@ -974,3 +974,69 @@ class TestWriteToFileLoopDetection:
             assert name in productive_tools or name == "write_to_file", (
                 f"After write loop hint, expected a productive tool call. Got: {name!r}"
             )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Issue: Exploding apply_diff — context corruption creates hundreds of
+#        duplicate hunks that must be deduplicated by the proxy (v1.6.24)
+#
+# Strategy: inject a pre-built exploding diff as the upstream LLM response
+# via AsyncMock (real HTTP endpoint, real pipeline, only upstream is mocked).
+# This reliably tests deduplication without requiring the model to actually
+# produce the corrupt diff.
+# ─────────────────────────────────────────────────────────────────────────────
+
+import os
+from unittest.mock import AsyncMock, patch
+import app.main as _main_module
+from tests.conftest import llm_response
+
+
+def _hunk(search: str, replace: str) -> str:
+    return f"<<<<<<< SEARCH\n{search}\n=======\n{replace}\n>>>>>>> REPLACE\n"
+
+
+def _apply_diff_xml(path: str, diff: str) -> str:
+    diff_escaped = diff.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return f"<apply_diff><path>{path}</path><diff>{diff_escaped}</diff></apply_diff>"
+
+
+class TestExplodingDiffLive:
+
+    def test_exploding_diff_is_deduplicated(self, client):
+        """
+        Simulate the real App.tsx incident: upstream returns an apply_diff
+        with 20 identical hunks + a truncated last hunk.
+
+        The proxy must:
+          - Deduplicate to exactly 1 unique hunk
+          - Drop the truncated hunk
+          - Return a valid apply_diff tool call with the cleaned diff
+        """
+        hunk = _hunk("setTasks(prev =>", "setTasks((prev: Task[]) =>")
+        truncated = "<<<<<<< SEARCH\nsetEditingId(prev =>\n=======\nsetEditingId((prev: number | null) =>\n"
+        exploding = hunk * 20 + truncated
+
+        mock = AsyncMock(return_value=llm_response(_apply_diff_xml("src/App.tsx", exploding)))
+        with patch.object(_main_module, "upstream_client") as mock_uc:
+            mock_uc.chat_completion = mock
+            resp = client.post("/v1/chat/completions", json={
+                "model": "openai/gpt-oss-120b",
+                "messages": [
+                    SYSTEM_MSG,
+                    user_msg("Add TypeScript type annotations to App.tsx"),
+                ],
+                "tools": [TOOL_APPLY_DIFF, TOOL_ATTEMPT_COMPLETION],
+            })
+
+        assert resp.status_code == 200, resp.text
+        name, args = parse_tool_call(resp.json())
+        assert name == "apply_diff", f"Expected apply_diff, got {name!r}"
+        diff = args["diff"]
+        hunk_count = diff.count("<<<<<<< SEARCH")
+        assert hunk_count == 1, (
+            f"Expected 1 hunk after deduplication, got {hunk_count}.\n"
+            f"Diff ({len(diff)} chars):\n{diff[:500]}"
+        )
+        assert "setTasks" in diff
+        assert "setEditingId" not in diff, "Truncated hunk must be dropped"

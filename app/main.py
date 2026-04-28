@@ -63,7 +63,7 @@ from app.services.xml_parser import (
 from app.services.audit_log import extract_file_info, setup_audit_logger, write_audit
 from app.services.xml_prompt_builder import build_xml_system_prompt
 
-VERSION = "1.6.22"  # unified diff → SEARCH/REPLACE converter for apply_diff
+VERSION = "1.7.0"  # deduplicate and drop truncated hunks in apply_diff (exploding diff fix)
 
 # Chat-Template-Leak artifacts produced by gpt-oss models — strip these from preamble text
 # but preserve any legitimate reasoning the model outputs before the XML tool call.
@@ -496,20 +496,6 @@ async def chat_completions(request: Dict[str, Any]):
             names = ", ".join(tc["function"]["name"] for tc in tool_calls)
             logger.info(f"[{request_id}] MCP XML parsed {len(tool_calls)} tool call(s): {names}")
 
-    # 5b. HINT: raw XML detected with no tool definitions (tools=0)
-    #     When the model outputs bare <tool_name>...</tool_name> XML but no tools were
-    #     registered, append a hint so the model learns to use <use_mcp_tool> next turn.
-    if not tool_calls and content and not tool_names:
-        if re.search(r"<[a-z][a-z_]+>", content):
-            hint = (
-                "\n\n[toolproxy] No tool definitions registered for this session. "
-                "To call MCP tools, use the <use_mcp_tool> wrapper:\n"
-                "<use_mcp_tool><server_name>SERVER</server_name>"
-                "<tool_name>TOOL</tool_name><arguments>{...}</arguments></use_mcp_tool>"
-            )
-            assistant_message["content"] = content + hint
-            logger.info(f"[{request_id}] Raw XML detected with tools=0 — injecting use_mcp_tool hint")
-            _audit["mechanism"] = "mcp_hint_injected"
 
     # 5c. FIXUP: move_file / rename_file → execute_command(mv ...)
     #     These are Roo builtins not in tools[] — Roo Code silently drops them.

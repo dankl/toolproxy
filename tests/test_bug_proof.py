@@ -17,6 +17,8 @@ from tests.conftest import _tool, DEFAULT_TOOLS
 from app.services.tool_call_fixups import (
     convert_move_file_to_execute_command,
     fix_ask_followup_question_params,
+    _deduplicate_diff_hunks,
+    validate_apply_diff_completeness,
 )
 
 
@@ -285,6 +287,104 @@ class TestAwaitingToolResultHallucination:
         messages = [{"role": "assistant", "content": [{"type": "text", "text": "Sure, I can help."}]}]
         normalized = normalize_messages(messages, request_id="test")
         assert "Sure, I can help." in normalized[0]["content"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BUG 5: Exploding apply_diff — context corruption causes repeated hunks
+#
+# When the model's context is corrupted it regenerates the same SEARCH/REPLACE
+# hunks dozens of times in a single apply_diff call.  The 21 000+ char diff
+# is passed through unchanged (it contains >>>>>>> REPLACE so the existing
+# completeness check treats it as valid).
+#
+# Real example: App.tsx patch with ~10 unique changes → diff contained each
+# hunk ~10–15 times + a truncated final hunk (no >>>>>>> REPLACE closing).
+#
+# Fix: _deduplicate_diff_hunks() deduplicates by SEARCH content and drops
+#      truncated trailing hunks; called from validate_apply_diff_completeness.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _hunk(search: str, replace: str) -> str:
+    return f"<<<<<<< SEARCH\n{search}\n=======\n{replace}\n>>>>>>> REPLACE\n"
+
+
+class TestDiffHunkDeduplication:
+
+    def test_clean_diff_passes_through_unchanged(self):
+        """A diff with all-unique hunks must not be modified."""
+        diff = _hunk("foo(prev =>", "foo((prev: T[]) =>") + _hunk("bar(x =>", "bar((x: number) =>")
+        cleaned, dropped = _deduplicate_diff_hunks(diff, "test")
+        assert dropped == 0
+        assert "foo(prev =>" in cleaned
+        assert "bar(x =>" in cleaned
+
+    def test_duplicate_hunks_are_removed(self):
+        """The same SEARCH/REPLACE block appearing N times must be kept exactly once."""
+        hunk = _hunk("setTasks(prev =>", "setTasks((prev: Task[]) =>")
+        diff = hunk * 10
+        cleaned, dropped = _deduplicate_diff_hunks(diff, "test")
+        assert dropped == 9
+        assert cleaned.count("<<<<<<< SEARCH") == 1
+        assert "setTasks(prev =>" in cleaned
+
+    def test_truncated_last_hunk_is_dropped(self):
+        """A hunk missing >>>>>>> REPLACE (model hit token limit) must be silently dropped."""
+        good = _hunk("setTasks(prev =>", "setTasks((prev: Task[]) =>")
+        truncated = "<<<<<<< SEARCH\nsetEditingId(prev =>\n=======\nsetEditingId((prev: number | null) =>\n"
+        diff = good + truncated
+        cleaned, dropped = _deduplicate_diff_hunks(diff, "test")
+        assert dropped == 1
+        assert "setTasks" in cleaned
+        assert "setEditingId" not in cleaned
+
+    def test_mixed_duplicates_and_unique_hunks(self):
+        """Duplicates are dropped; unique hunks are preserved in order."""
+        h1 = _hunk("alpha =>", "(alpha: A) =>")
+        h2 = _hunk("beta =>", "(beta: B) =>")
+        diff = h1 + h2 + h1 + h2 + h1   # h1 ×3, h2 ×2
+        cleaned, dropped = _deduplicate_diff_hunks(diff, "test")
+        assert dropped == 3
+        assert cleaned.count("<<<<<<< SEARCH") == 2
+        assert "alpha =>" in cleaned
+        assert "beta =>" in cleaned
+
+    def test_real_world_exploding_diff(self):
+        """
+        Replica of the App.tsx incident: ~10 unique hunks each repeated 10×
+        plus a truncated last hunk.  After cleanup only unique hunks remain.
+        """
+        unique_hunks = [
+            _hunk("setTasks(prev =>", "setTasks((prev: Task[]) =>"),
+            _hunk("setEditingId(prev =>", "setEditingId((prev: number | null) =>"),
+            _hunk("setNewTask(prev =>", "setNewTask((prev: Partial<Task>) =>"),
+            _hunk("handleChange = (", "handleChange = (\n  e: ChangeEvent<HTMLInputElement>"),
+            _hunk("tasks.find(t =>", "tasks.find((t: Task) =>"),
+        ]
+        truncated = "<<<<<<< SEARCH\nsetTasks(prev =>\n=======\nsetTasks((prev: Task[]) =>\n"
+        diff = "".join(unique_hunks * 10) + truncated
+        cleaned, dropped = _deduplicate_diff_hunks(diff, "test")
+        # 10 repetitions - 1 kept = 9 dropped per unique hunk (5 × 9 = 45) + 1 truncated
+        assert dropped == 46
+        assert cleaned.count("<<<<<<< SEARCH") == len(unique_hunks)
+
+    def test_validate_apply_diff_completeness_deduplicates(self):
+        """validate_apply_diff_completeness must call deduplication for correct-format diffs."""
+        hunk = _hunk("old_code", "new_code")
+        bloated_diff = hunk * 5
+        tool_calls = [{
+            "id": "call_001",
+            "type": "function",
+            "function": {
+                "name": "apply_diff",
+                "arguments": json.dumps({"path": "src/App.tsx", "diff": bloated_diff}),
+            },
+        }]
+        result = validate_apply_diff_completeness(tool_calls, "test")
+        assert result, "Tool call must not be dropped"
+        args = json.loads(result[0]["function"]["arguments"])
+        assert args["diff"].count("<<<<<<< SEARCH") == 1, (
+            "Duplicate hunks must be removed by validate_apply_diff_completeness"
+        )
 
     def test_leak_pattern_strips_awaiting_tool_result(self):
         """
@@ -1798,33 +1898,34 @@ class TestPrimingRequiresGating:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FIX v1.6.17: use_mcp_tool hint injection for raw XML with tools=0
+# FIX v1.6.23: remove use_mcp_tool hint injection for raw XML with tools=0
 # File: app/main.py
 #
-# When a generic client sends requests with no tool definitions (tools=0),
-# the model outputs raw XML like <list_datasources>. Toolproxy returned this
-# as plain text with no hint, causing the model to retry with different formats.
-# Fix: detect raw XML tags in content when tools=0 and append a hint.
+# The hint polluted the model's context when the client (e.g. Roo Code in
+# XML-passthrough mode) was already handling the raw XML natively.
+# The "[toolproxy] No tool definitions registered..." text was fed back into
+# the model context on every turn, causing drift and confusing the model.
+# Fix: remove the hint injection entirely — clients that handle XML-in-text
+# do not need guidance; clients using use_mcp_tool already work via MCP path.
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestMcpHintInjection:
 
-    def test_raw_xml_with_no_tools_injects_hint(self, client):
+    def test_raw_xml_with_no_tools_passes_through_unchanged(self, client):
         """
         Model outputs raw <list_datasources>...</list_datasources> with tools=[].
-        Response content must contain the use_mcp_tool format hint.
+        Response content must be passed through as-is — no hint appended.
 
-        Reproduces the grafana-mcp loop (2026-04-16 08:06–08:09) where the
-        model oscillated between raw XML and use_mcp_tool format.
+        v1.6.23: hint injection removed because it polluted model context for
+        clients that handle XML-in-text natively (Roo Code XML passthrough mode).
         """
         from unittest.mock import AsyncMock, patch
         import app.main as main_module
         from tests.conftest import llm_response
 
-        raw_xml = llm_response("<list_datasources>\n<type>prometheus</type>\n</list_datasources>")
-
+        raw_xml = "<list_datasources>\n<type>prometheus</type>\n</list_datasources>"
         with patch.object(main_module, "upstream_client") as mock_uc:
-            mock_uc.chat_completion = AsyncMock(return_value=raw_xml)
+            mock_uc.chat_completion = AsyncMock(return_value=llm_response(raw_xml))
             resp = client.post("/v1/chat/completions", json={
                 "model": "oracle-llm",
                 "messages": [{"role": "user", "content": "List Prometheus datasources."}],
@@ -1835,13 +1936,14 @@ class TestMcpHintInjection:
         msg = resp.json()["choices"][0]["message"]
         content = msg.get("content") or ""
 
-        assert "use_mcp_tool" in content, (
-            "Raw XML with tools=0 must trigger use_mcp_tool hint injection.\n"
+        assert "use_mcp_tool" not in content, (
+            "Hint must NOT be injected — hint injection was removed in v1.6.23.\n"
             f"Content: {content[:300]!r}"
         )
-        assert not (msg.get("tool_calls")), (
-            "No tool_calls should be present — this is a text hint, not a parsed tool call."
+        assert "[toolproxy]" not in content, (
+            "toolproxy must not append any internal hint text to client responses."
         )
+        assert not msg.get("tool_calls"), "No tool_calls for raw XML with tools=0"
 
     def test_raw_xml_with_tools_defined_no_hint(self, client):
         """When tools ARE defined, XML is parsed normally — no hint injected."""

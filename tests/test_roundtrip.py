@@ -1732,6 +1732,85 @@ class TestHistoryNormalizationUpstream:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Exploding apply_diff deduplication (v1.6.24)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _hunk(search: str, replace: str) -> str:
+    return f"<<<<<<< SEARCH\n{search}\n=======\n{replace}\n>>>>>>> REPLACE\n"
+
+
+class TestExplodingDiffDeduplication:
+
+    def _apply_diff_xml(self, path: str, diff: str) -> str:
+        diff_escaped = diff.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        return (
+            f"<apply_diff><path>{path}</path>"
+            f"<diff>{diff_escaped}</diff></apply_diff>"
+        )
+
+    def test_duplicate_hunks_are_deduplicated_in_pipeline(self, client, llm):
+        """
+        Upstream returns an apply_diff with 10 identical hunks.
+        The proxy must deduplicate to exactly 1 hunk before returning the tool call.
+        """
+        hunk = _hunk("setTasks(prev =>", "setTasks((prev: Task[]) =>")
+        exploding_diff = hunk * 10
+        llm.return_value = llm_response(
+            self._apply_diff_xml("src/App.tsx", exploding_diff)
+        )
+        resp = client.post("/v1/chat/completions", json={
+            "model": "test-model",
+            "messages": [SYSTEM_MSG, user_msg("Add types to App.tsx")],
+            "tools": DEFAULT_TOOLS,
+        })
+        assert resp.status_code == 200
+        name, args = parse_tool_call(resp.json())
+        assert name == "apply_diff"
+        assert args["diff"].count("<<<<<<< SEARCH") == 1, (
+            f"Expected 1 hunk after deduplication, got:\n{args['diff']}"
+        )
+
+    def test_truncated_last_hunk_dropped_in_pipeline(self, client, llm):
+        """Upstream returns a diff with a good hunk + truncated last hunk. Truncated must be dropped."""
+        good = _hunk("setTasks(prev =>", "setTasks((prev: Task[]) =>")
+        truncated = "<<<<<<< SEARCH\nsetEditingId(prev =>\n=======\nsetEditingId((prev: number | null) =>\n"
+        llm.return_value = llm_response(
+            self._apply_diff_xml("src/App.tsx", good + truncated)
+        )
+        resp = client.post("/v1/chat/completions", json={
+            "model": "test-model",
+            "messages": [SYSTEM_MSG, user_msg("Fix App.tsx")],
+            "tools": DEFAULT_TOOLS,
+        })
+        assert resp.status_code == 200
+        name, args = parse_tool_call(resp.json())
+        assert name == "apply_diff"
+        assert args["diff"].count("<<<<<<< SEARCH") == 1
+        assert "setTasks" in args["diff"]
+        assert "setEditingId" not in args["diff"]
+
+    def test_clean_diff_passes_through_in_pipeline(self, client, llm):
+        """A diff with 3 unique hunks must reach the client with all 3 intact."""
+        diff = (
+            _hunk("alpha =>", "(alpha: A) =>")
+            + _hunk("beta =>", "(beta: B) =>")
+            + _hunk("gamma =>", "(gamma: C) =>")
+        )
+        llm.return_value = llm_response(
+            self._apply_diff_xml("src/util.ts", diff)
+        )
+        resp = client.post("/v1/chat/completions", json={
+            "model": "test-model",
+            "messages": [SYSTEM_MSG, user_msg("Fix util.ts")],
+            "tools": DEFAULT_TOOLS,
+        })
+        assert resp.status_code == 200
+        name, args = parse_tool_call(resp.json())
+        assert name == "apply_diff"
+        assert args["diff"].count("<<<<<<< SEARCH") == 3
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # YAML-like tool call format
 # ──────────────────────────────────────────────────────────────────────────────
 

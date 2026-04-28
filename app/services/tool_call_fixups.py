@@ -261,6 +261,39 @@ def convert_new_file_diffs(
 
 _DIFF_TOOLS = {"apply_diff", "replace_in_file"}
 
+_HUNK_START = "<<<<<<< SEARCH\n"
+_HUNK_SEP = "\n=======\n"
+_HUNK_END = "\n>>>>>>> REPLACE"
+
+
+def _deduplicate_diff_hunks(diff: str, request_id: str) -> tuple:
+    """Remove duplicate and truncated SEARCH/REPLACE hunks.
+
+    Returns (cleaned_diff, num_dropped).
+    Duplicate = identical SEARCH block seen before.
+    Truncated = hunk missing >>>>>>> REPLACE (e.g. model hit token limit mid-diff).
+    """
+    parts = diff.split(_HUNK_START)
+    seen: set = set()
+    kept: list = []
+    dropped = 0
+
+    for part in parts[1:]:
+        sep = part.find(_HUNK_SEP)
+        end = part.find(_HUNK_END)
+        if sep == -1 or end == -1 or sep >= end:
+            dropped += 1
+            continue
+        search_content = part[:sep]
+        if search_content in seen:
+            dropped += 1
+            continue
+        seen.add(search_content)
+        kept.append(_HUNK_START + part[: end + len(_HUNK_END)] + "\n")
+
+    return "".join(kept), dropped
+
+
 # Matches a unified diff hunk header.
 # Handles both the full form "@@ -1,3 +1,4 @@" and the minimal "@@ " or bare "@@"
 # that some models emit as a shorthand.
@@ -368,8 +401,21 @@ def validate_apply_diff_completeness(
 
         diff = args.get("diff", "")
 
-        # Already correct format — pass through
+        # Already correct format — deduplicate hunks then pass through
         if not diff or ">>>>>>> REPLACE" in diff:
+            if diff and _HUNK_START in diff:
+                cleaned, dropped = _deduplicate_diff_hunks(diff, request_id)
+                if dropped:
+                    logger.warning(
+                        f"[{request_id}] apply_diff: dropped {dropped} duplicate/truncated "
+                        f"hunk(s) for {args.get('path', '?')!r} "
+                        f"({len(diff)} → {len(cleaned)} chars)"
+                    )
+                    args = dict(args)
+                    args["diff"] = cleaned
+                    tc = dict(tc)
+                    tc["function"] = dict(tc["function"])
+                    tc["function"]["arguments"] = json.dumps(args)
             result.append(tc)
             continue
 
