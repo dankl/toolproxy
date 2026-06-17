@@ -53,5 +53,25 @@ class Settings(BaseSettings):
         ),
     )
 
+    # Content filter (pre-request OCI safety filter prevention)
+    content_filter_patterns: str = Field(
+        default="",
+        description=(
+            "JSON array of pattern objects for pre-request content filtering. "
+            "Each object: {\"pattern\": \"regex\", \"replacement\": \"str\", \"reason\": \"str\"}. "
+            "Empty = use built-in defaults. Example: "
+            '[{"pattern": "(?i)\\\\bhack\\\\b", "replacement": "", "reason": "Hacking slang"}]'
+        ),
+    )
+    content_filter_mode: str = Field(
+        default="detect",
+        description=(
+            "Content filter mode: 'detect' (log + warn, let request through), "
+            "'sanitize' (replace matched content and log), "
+            "'block' (return error before upstream call). "
+            "Default: detect."
+        ),
+    )
+
 
 settings = Settings()

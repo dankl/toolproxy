@@ -7,6 +7,7 @@ apply_diff→write_to_file conversion, and attempt_completion XML rescue.
 import json
 import logging
 import re
+import shlex
 from typing import Dict, List, Optional
 
 from app.services.json_repair import safe_parse_json
@@ -469,7 +470,7 @@ def convert_move_file_to_execute_command(
             source = args.get("source") or args.get("path") or args.get("old_path") or ""
             dest = args.get("destination") or args.get("new_name") or args.get("new_path") or ""
             if source and dest:
-                cmd = f"mv '{source}' '{dest}'"
+                cmd = f"mv {shlex.quote(source)} {shlex.quote(dest)}"
                 logger.info(f"[{request_id}] Convert {name} → execute_command: {cmd!r}")
                 tc = {
                     **tc,
@@ -614,9 +615,75 @@ def fix_ask_followup_question_params(
                     **tc,
                     "function": {
                         "name": "ask_followup_question",
-                        "arguments": json.dumps(args),
-                    },
-                }
-
+                    "arguments": json.dumps(args),
+                },
+            }
         result.append(tc)
+    return result
+
+
+def flatten_edit_nesting(
+    tool_calls: List[Dict], request_id: str
+) -> List[Dict]:
+    """
+    Convert flat edit args to the nested format the edit tool schema expects.
+
+    The model sometimes outputs a flat edit:
+        {"path": "file.py", "oldString": "old", "newString": "new"}
+    But the edit tool expects:
+        {"path": "file.py", "edits": [{"oldText": "old", "newText": "new"}]}
+
+    Also handles the model's native nested XML output:
+        <edit><path>file.py</path><edits><edit><oldString>old</oldString>...
+    which parses to {"path": ..., "edits": {"edit": {...}}}.
+    This is converted to the same {"path": ..., "edits": [{...}]} format.
+    """
+    result = []
+    for tc in tool_calls:
+        name = tc.get("function", {}).get("name", "")
+        if name != "edit":
+            result.append(tc)
+            continue
+
+        try:
+            args = json.loads(tc["function"].get("arguments", "{}"))
+        except (json.JSONDecodeError, KeyError):
+            result.append(tc)
+            continue
+
+        path = str(args.get("path", "") or args.get("filePath", "") or args.get("file_path", ""))
+
+        # Case 1: model output nested XML → already parsed as {"edits": {"edit": {...}}}
+        edits_wrapper = args.get("edits")
+        if isinstance(edits_wrapper, dict) and "edit" in edits_wrapper:
+            inner = edits_wrapper["edit"]
+            if isinstance(inner, dict):
+                inner = [inner]
+            if inner:
+                first = inner[0]
+                old = first.get("oldString") or first.get("old_string") or first.get("oldstring") or first.get("oldText") or ""
+                new = first.get("newString") or first.get("new_string") or first.get("newstring") or first.get("newText") or ""
+                if old and new:
+                    out = {"edits": [{"oldText": old, "newText": new}]}
+                    if path:
+                        out["path"] = path
+                    logger.info(f"[{request_id}] Converted nested edit XML → edits[oldText/newText] (path={path!r})")
+                    result.append({**tc, "function": {"name": "edit", "arguments": json.dumps(out, ensure_ascii=False)}})
+                    continue
+
+        # Case 2: flat format → wrap in edits array
+        if "edits" not in args and ("oldString" in args or "newString" in args or "old_string" in args or "new_string" in args or "oldText" in args or "newText" in args):
+            old = args.get("oldString") or args.get("old_string") or args.get("oldstring") or args.get("oldText") or ""
+            new = args.get("newString") or args.get("new_string") or args.get("newstring") or args.get("newText") or ""
+            if old and new:
+                out = {"edits": [{"oldText": old, "newText": new}]}
+                if path:
+                    out["path"] = path
+                logger.info(f"[{request_id}] Wrapped flat edit → edits[oldText/newText] (path={path!r})")
+                result.append({**tc, "function": {"name": "edit", "arguments": json.dumps(out, ensure_ascii=False)}})
+                continue
+
+        # Case 3: already has edits array or unknown format → pass through
+        result.append(tc)
+
     return result

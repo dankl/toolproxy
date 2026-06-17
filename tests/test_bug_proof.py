@@ -418,6 +418,20 @@ class TestDiffHunkDeduplication:
         cleaned = _LEAK_PATTERN.sub("", text).strip()
         assert cleaned == text, f"Legitimate preamble was incorrectly stripped: {cleaned!r}"
 
+    def test_leak_pattern_strips_no_reply_sentinel(self):
+        """The `NO_REPLY` sentinel some models append after a tool call must be stripped.
+
+        Regression: gpt-oss emits `<exec>...</exec>NO_REPLY` — once the XML is parsed
+        the trailing `NO_REPLY` would otherwise leak to the client as preamble text.
+        """
+        from app.main import _LEAK_PATTERN
+
+        for text in ["NO_REPLY", "NO_REPLY ", "no_reply"]:
+            cleaned = _LEAK_PATTERN.sub("", text).strip()
+            assert cleaned == "", (
+                f"BUG: _LEAK_PATTERN did not strip {text!r}. Result: {cleaned!r}"
+            )
+
 
 class TestPathConsistencyRule:
 
