@@ -16,7 +16,11 @@ from app.services.xml_parser import (
     extract_mcp_tool_calls,
     extract_xml_tool_calls,
     fix_xml_string,
+    parse_xml_to_arguments,
     xml_element_to_dict,
+    _convert_self_closing_tags,
+    _convert_attributes_to_elements,
+    _strip_cdata,
 )
 
 TOOL_NAMES = [
@@ -103,6 +107,37 @@ class TestFixXmlString:
         fixed = fix_xml_string(xml)
         root = ET.fromstring(fixed)
         assert "<docs>" in root.find("result").text
+
+    def test_escapes_heredoc_in_command(self):
+        """Shell heredocs (python3 - <<'PY' ... PY) contain bare < that break ET.
+
+        <command> is a raw-text tag so its content must be escaped before parsing,
+        then restored verbatim on read. Regression for the OpenClaw bug where
+        <exec><command>python3 - <<'PY' ...</command></exec> was dropped and the
+        raw XML leaked to the client.
+        """
+        xml = (
+            "<execute_command>"
+            "<command>python3 - <<'PY'\nimport chromadb\nprint('ok')\nPY\n</command>"
+            "</execute_command>"
+        )
+        fixed = fix_xml_string(xml)
+        root = ET.fromstring(fixed)  # must not raise
+        cmd = root.find("command").text
+        assert "<<'PY'" in cmd
+        assert "import chromadb" in cmd
+        assert cmd.rstrip().endswith("PY")
+
+    def test_escapes_redirect_in_command(self):
+        """Shell redirects (sort < in.txt > out.txt) must survive parsing."""
+        xml = (
+            "<execute_command>"
+            "<command>sort < in.txt > out.txt</command>"
+            "</execute_command>"
+        )
+        fixed = fix_xml_string(xml)
+        root = ET.fromstring(fixed)
+        assert root.find("command").text == "sort < in.txt > out.txt"
 
     def test_no_double_escaping_of_entities(self):
         """Content that already uses &lt; must not be double-escaped."""
@@ -352,6 +387,34 @@ class TestExtractXmlToolCalls:
         assert calls[0].name == "read_file"
         assert calls[1].name == "write_to_file"
 
+    def test_exec_alias_with_heredoc_command(self):
+        """Regression: <exec> alias with a heredoc-bearing <command>.
+
+        The model output `<exec><command>python3 - <<'PY' ... PY</command></exec>`
+        followed by a `NO_REPLY` sentinel. Previously the bare `<<` broke
+        ET.fromstring (command was not a raw-text tag), so the tool call was
+        dropped and the raw XML + NO_REPLY leaked to the client.
+        """
+        content = (
+            "<exec><command>python3 - <<'PY'\n"
+            "import chromadb\n"
+            "client = chromadb.HttpClient(host=\"localhost\", port=\"8000\")\n"
+            "print(client.get_collection(name=\"docs\").count())\n"
+            "PY\n"
+            "</command></exec>NO_REPLY "
+        )
+        calls, remaining = extract_xml_tool_calls(content, ["execute_command", "exec"])
+        assert len(calls) == 1
+        assert calls[0].name == "exec"
+        cmd = calls[0].arguments["command"]
+        assert "<<'PY'" in cmd
+        assert "import chromadb" in cmd
+        assert cmd.rstrip().endswith("PY")
+        # XML block fully removed; only the trailing sentinel remains
+        assert "<exec>" not in remaining
+        assert "<command>" not in remaining
+        assert "NO_REPLY" in remaining
+
     def test_empty_content_returns_nothing(self):
         calls, rem = extract_xml_tool_calls("", TOOL_NAMES)
         assert calls == []
@@ -541,3 +604,158 @@ class TestExtractMcpToolCalls:
         assert tc["function"]["name"] == "grafana-mcp__list_datasources"
         args = json.loads(tc["function"]["arguments"])
         assert args == {"type": "loki"}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CDATA handling
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestCdataHandling:
+    def test_strip_cdata_simple(self):
+        assert _strip_cdata("<![CDATA[hello]]>") == "hello"
+
+    def test_strip_cdata_with_xml_inside(self):
+        raw = "<![CDATA[<path>foo</path>]]>"
+        assert _strip_cdata(raw) == "<path>foo</path>"
+
+    def test_strip_cdata_mixed_content(self):
+        raw = "before<![CDATA[inner]]>after"
+        assert _strip_cdata(raw) == "beforeinnerafter"
+
+    def test_cdata_in_content_tag_survives_parsing(self):
+        xml = (
+            "<write_to_file>"
+            "<path>foo.html</path>"
+            "<content><![CDATA[<div>Hello</div>]]></content>"
+            "</write_to_file>"
+        )
+        args, tid, reason = parse_xml_to_arguments(xml, "write_to_file")
+        assert "<div>Hello</div>" in str(args.get("content", ""))
+
+    def test_cdata_inside_write_to_file_content(self):
+        xml = (
+            "<write_to_file>"
+            "<path>foo.html</path>"
+            "<content><![CDATA[<repo-url>https://example.com</repo-url>]]></content>"
+            "</write_to_file>"
+        )
+        args, tid, reason = parse_xml_to_arguments(xml, "write_to_file")
+        content = args.get("content", "")
+        assert "<repo-url>" in content
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Self-closing tag handling
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestSelfClosingTags:
+    def test_self_closing_param_converted(self):
+        result = _convert_self_closing_tags("<path/>")
+        assert result == "<path></path>"
+
+    def test_self_closing_with_whitespace(self):
+        result = _convert_self_closing_tags("<path />")
+        assert result == "<path></path>"
+
+    def test_self_closing_in_tool_call(self):
+        xml = "<read_file><path /></read_file>"
+        result = _convert_self_closing_tags(xml)
+        assert "<path></path>" in result
+
+    def test_self_closing_parsed_successfully(self):
+        xml = "<read_file><path /></read_file>"
+        fixed = fix_xml_string(xml)
+        args, tid, reason = parse_xml_to_arguments(fixed, "read_file")
+        assert args.get("path") == ""
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Attribute format handling
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestAttributeFormat:
+    def test_attributes_converted_to_elements(self):
+        xml = '<write_to_file path="README.md" content="# Hello" />'
+        result = _convert_attributes_to_elements(xml)
+        assert "<path>README.md</path>" in result
+        assert "<content># Hello</content>" in result
+
+    def test_attribute_format_parsed_successfully(self):
+        xml = '<write_to_file path="README.md" content="# Hello" />'
+        fixed = fix_xml_string(xml)
+        args, tid, reason = parse_xml_to_arguments(fixed, "write_to_file")
+        assert args.get("path") == "README.md"
+        assert args.get("content") == "# Hello"
+
+    def test_mixed_attribute_and_element_still_works(self):
+        """Some models mix attributes and child elements."""
+        xml = '<apply_diff path="app.py"><diff>old\nnew</diff></apply_diff>'
+        fixed = fix_xml_string(xml)
+        args, tid, reason = parse_xml_to_arguments(fixed, "apply_diff")
+        assert args.get("path") == "app.py"
+        assert "old" in args.get("diff", "")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Robust fallback parsing
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestRobustFallbackParsing:
+    def test_missing_root_close_still_parsed(self):
+        """Truncated XML without closing root tag should still parse via wrapped-root fallback."""
+        xml = "<write_to_file><path>foo.py</path><content>print('hello')</content>"
+        # No </write_to_file> — should still parse
+        args, tid, reason = parse_xml_to_arguments(xml, "write_to_file")
+        assert args.get("path") == "foo.py"
+        assert "hello" in str(args.get("content", ""))
+
+    def test_extra_whitespace_in_tags(self):
+        xml = "< write_to_file ><path>foo</path></ write_to_file >"
+        # ET is lenient with whitespace in tags — should still work after fix
+        fixed = fix_xml_string(xml)
+        args, tid, reason = parse_xml_to_arguments(fixed, "write_to_file")
+        assert args.get("path") == "foo"
+
+    def test_case_insensitive_tag_names(self):
+        """Model sometimes uses uppercase in tag names. Keys preserved as-is,
+        case-insensitive matching is handled by _remap_args_to_schema downstream."""
+        xml = "<WRITE_TO_FILE><PATH>foo.py</PATH><CONTENT>print('hi')</CONTENT></WRITE_TO_FILE>"
+        args, tid, reason = parse_xml_to_arguments(xml, "write_to_file")
+        # Keys are uppercase because xml_element_to_dict preserves tag case
+        assert args.get("PATH") == "foo.py"
+        assert args.get("CONTENT") == "print('hi')"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Escaping edge cases
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestEscapingEdgeCases:
+    def test_xml_in_string_values_old_and_new(self):
+        """OpenCode edit tool: oldString/newString may contain XML-like content.
+        Keys preserve XML tag case; schema remap handles normalization downstream."""
+        xml = (
+            "<edit>"
+            "<filePath>main.py</filePath>"
+            "<oldString>if x &lt; 5:</oldString>"
+            "<newString>if x &lt;= 5:</newString>"
+            "</edit>"
+        )
+        fixed = fix_xml_string(xml)
+        args, tid, reason = parse_xml_to_arguments(fixed, "edit")
+        assert "x < 5" in str(args.get("oldString", ""))
+        assert "x <= 5" in str(args.get("newString", ""))
+
+    def test_arrow_function_in_content(self):
+        """JavaScript arrow functions use => which can confuse XML heuristics."""
+        xml = (
+            "<write_to_file>"
+            "<path>app.js</path>"
+            "<content>const fn = (req, res) => { return res.json({ ok: true }); }</content>"
+            "</write_to_file>"
+        )
+        fixed = fix_xml_string(xml)
+        args, tid, reason = parse_xml_to_arguments(fixed, "write_to_file")
+        content = args.get("content", "")
+        assert "req, res" in content
+        assert "=>" in content

@@ -38,6 +38,7 @@ from app.services.tool_call_fixups import (
     convert_move_file_to_execute_command,
     convert_new_file_diffs,
     fix_ask_followup_question_params,
+    flatten_edit_nesting,
     parse_json_fallback,
     rescue_xml_in_attempt_completion,
     validate_apply_diff_completeness,
@@ -61,6 +62,7 @@ from app.services.xml_parser import (
     extract_xml_tool_calls,
 )
 from app.services.audit_log import extract_file_info, setup_audit_logger, write_audit
+from app.services.content_filter import sanitize_messages, scan_messages
 from app.services.xml_prompt_builder import build_xml_system_prompt
 
 VERSION = "1.7.0"  # deduplicate and drop truncated hunks in apply_diff (exploding diff fix)
@@ -71,6 +73,7 @@ _LEAK_PATTERN = re.compile(
     r"\[assistant\s+to=\S+[^\]]*\]"         # [assistant to=write_to_file code<|message|>...]
     r"|<assistant\s+to=\S+[^>]*>"           # <assistant to=write_to_file code>...
     r"|(?:\[Awaiting tool results?\]\s*)+"  # model hallucinating pending tool execution
+    r"|NO_REPLY\b"                          # sentinel some models append after a tool call
     ,
     re.IGNORECASE,
 )
@@ -356,6 +359,45 @@ async def chat_completions(request: Dict[str, Any]):
     #     remind the model it may use read_file offset= or write_to_file but must NOT hallucinate [Tool Result]
     messages = _inject_truncation_reminder(messages, request_id)
 
+    # 3d. Pre-request content filter — scan for patterns that might trigger OCI's safety
+    #     filter BEFORE sending to upstream. Supports three modes:
+    #     - "detect":   log warning, let request through
+    #     - "sanitize": auto-replace known triggers, let request through
+    #     - "block":    return 400 before upstream call (saves token cost & time)
+    if settings.content_filter_mode not in ("off", "disabled", ""):
+        hits = scan_messages(messages, request_id)
+        if hits:
+            for h in hits:
+                logger.warning(
+                    f"[{request_id}] CONTENT FILTER: {h['reason']} in {h['location']} "
+                    f"(matched: {h['matched_text']!r})"
+                )
+            if settings.content_filter_mode == "block":
+                logger.error(
+                    f"[{request_id}] Content filter blocked {len(hits)} trigger(s) "
+                    f"in pre-request scan — returning 400"
+                )
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": {
+                        "message": (
+                            "Request blocked by pre-request content filter: "
+                            f"detected {len(hits)} pattern(s) known to trigger "
+                            "the upstream safety filter. Try rephrasing: "
+                            + "; ".join(h["reason"] for h in hits[:3])
+                        ),
+                        "type": "content_filter_error",
+                        "details": hits,
+                    }},
+                )
+            if settings.content_filter_mode == "sanitize":
+                messages, modified = sanitize_messages(messages, request_id)
+                if modified:
+                    logger.info(
+                        f"[{request_id}] Content filter sanitized {len(hits)} trigger(s) "
+                        f"in pre-request scan — continuing with modified content"
+                    )
+
     # 4. Call upstream LLM (no native tools forwarded — model doesn't support them)
     # Default to 8192 tokens if not specified — many models have low defaults (e.g. 2048)
     # which is too small for large file writes. Model stops naturally when done.
@@ -570,6 +612,11 @@ async def chat_completions(request: Dict[str, Any]):
         assistant_message["tool_calls"] = tool_calls
         if tool_calls and tool_calls[0]["function"]["name"] != _before_guard:
             _audit["mechanism"] = "write_guard"
+
+    # 10c. FLATTEN EDIT: convert nested <edits><edit> into flat <edit> for OpenCode
+    if tool_calls:
+        tool_calls = flatten_edit_nesting(tool_calls, request_id)
+        assistant_message["tool_calls"] = tool_calls
 
     # 11. NORMALIZE: ask_followup_question follow_up string → array
     if tool_calls:

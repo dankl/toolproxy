@@ -90,7 +90,94 @@ def extract_xml_tool_calls(
             logger.warning(f"{log_prefix}Failed to parse XML tool call: {e}")
             continue
 
-    return tool_calls, remaining_content.strip()
+    # Remove nested/contained duplicate tool calls (e.g. inner <edit> inside <edits><edit>)
+    # Remove if tc is contained in other AND tc is smaller (inner block)
+    deduped: List[XMLToolCall] = []
+    for tc in tool_calls:
+        if any(
+            other is not tc and other.name == tc.name 
+            and tc.raw_xml in other.raw_xml 
+            and len(tc.raw_xml) < len(other.raw_xml)
+            for other in tool_calls
+        ):
+            logger.debug(f"{log_prefix}Removing nested {tc.name} (contained in larger {tc.name})")
+            continue
+        deduped.append(tc)
+
+    # Remove exact duplicate tool calls (same name and arguments)
+    seen = set()
+    final: List[XMLToolCall] = []
+    for tc in deduped:
+        key = (tc.name, json.dumps(tc.arguments, sort_keys=True))
+        if key in seen:
+            logger.info(f"{log_prefix}Removing duplicate {tc.name} call (identical arguments)")
+            continue
+        seen.add(key)
+        final.append(tc)
+
+    return final, remaining_content.strip()
+
+
+def _close_unclosed_root(xml_string: str) -> str:
+    """If the outermost tag is unclosed, append its closing tag.
+
+    Handles:   <write_to_file><path>foo</path>   (missing </write_to_file>)
+    Returns:   <write_to_file><path>foo</path></write_to_file>
+    """
+    # Find the root tag name (first <tagname ...> at start, after whitespace)
+    m = re.match(r'\s*<\s*(\w+)(?:\s[^>]*)?>', xml_string)
+    if not m:
+        return xml_string
+    root_name = m.group(1)
+    # Check if closing tag already exists
+    if re.search(rf'</\s*{re.escape(root_name)}\s*>', xml_string, re.IGNORECASE):
+        return xml_string  # already closed
+    return xml_string + f'</{root_name}>'
+
+
+def _strip_whitespace_in_tags(xml_string: str) -> str:
+    """Strip whitespace between < and tag name: < write_to_file > → <write_to_file>
+
+    Uses negative lookbehind to avoid affecting non-XML patterns
+    like <<<<<<< SEARCH (multiple consecutive < characters).
+
+    The lookahead ``(?=[\\s/>])`` requires the matched word to be followed by
+    whitespace, ``/`` or ``>`` — i.e. it must look like a real tag. This prevents
+    corrupting shell redirects inside raw-text tags such as
+    ``<command>sort < in.txt</command>`` (where ``< in`` would otherwise be
+    collapsed to ``<in``).
+    """
+    # Fix opening tags: < tagname → <tagname (only when it looks like a tag)
+    s = re.sub(r'(?<!<)<\s+(\w+)(?=[\s/>])', r'<\1', xml_string)
+    # Fix closing tags: </ tagname > → </tagname>
+    s = re.sub(r'</\s+(\w+)\s*>', r'</\1>', s)
+    return s
+
+
+def _parse_xml_with_fallback(xml_string: str) -> Optional[ET.Element]:
+    """Try multiple strategies to parse XML, falling back through alternatives.
+
+    Strategy order:
+    1. Direct ET.fromstring (already fixed)
+    2. Close unclosed root tag and retry
+    3. Wrap in synthetic root if it looks like multiple fragments
+    """
+    strategies = [
+        ("direct", lambda s: ET.fromstring(s)),
+        ("close_root", lambda s: ET.fromstring(_close_unclosed_root(s))),
+        ("wrapped_root", lambda s: ET.fromstring(f"<root>{_close_unclosed_root(s)}</root>") if not s.strip().startswith("<root") else None),
+    ]
+    errors = []
+    for name, fn in strategies:
+        try:
+            result = fn(xml_string)
+            if result is not None:
+                return result
+        except ET.ParseError as e:
+            errors.append(f"{name}: {e}")
+            continue
+    logger.debug(f"XML parse fallback exhausted. Errors: {'; '.join(errors)}")
+    return None
 
 
 def parse_xml_to_arguments(
@@ -111,7 +198,18 @@ def parse_xml_to_arguments(
     # before ET parsing — this prevents JSX/HTML inside <content> from being
     # misinterpreted as XML child elements even when the raw XML is technically valid.
     fixed_xml = fix_xml_string(xml_string)
-    root = ET.fromstring(fixed_xml)
+    root = _parse_xml_with_fallback(fixed_xml)
+    if root is None:
+        raise ValueError(f"Failed to parse XML after all fallback strategies for '{expected_tool_name}'")
+
+    # If we used wrapped_root strategy, unwrap to find the actual tool element
+    if root.tag == "root":
+        for child in root:
+            if child.tag.lower() == expected_tool_name.lower():
+                root = child
+                break
+        else:
+            raise ValueError(f"Root tag not found after wrapped-root fallback for '{expected_tool_name}'")
 
     # Verify root tag matches expected tool name
     if root.tag.lower() != expected_tool_name.lower():
@@ -144,6 +242,9 @@ def xml_element_to_dict(elem: ET.Element) -> Dict[str, Any]:
     - Nested elements
     - Repeated elements (converted to lists)
     - Attributes
+    - Tag names are preserved as-is (case-sensitive). The schema remap step
+      (_remap_args_to_schema in tool_mapping.py) handles case normalization
+      via _SCHEMA_PARAM_ALIASES.
     """
     result = {}
 
@@ -172,13 +273,115 @@ def xml_element_to_dict(elem: ET.Element) -> Dict[str, Any]:
     return result
 
 
+def _convert_self_closing_tags(xml_string: str) -> str:
+    """Convert self-closing tags to open/close pairs: <param/> → <param></param>
+
+    The model sometimes outputs empty params as <path/> instead of <path></path>.
+    ET.fromstring handles self-closing tags fine, but our regex-based extraction
+    and raw-text escaping works better with explicit open/close pairs.
+    """
+    return re.sub(
+        r'<(\w+)([^>]*?)\s*/>',
+        r'<\1\2></\1>',
+        xml_string,
+        flags=re.IGNORECASE,
+    )
+
+
+def _convert_attributes_to_elements(xml_string: str) -> str:
+    """Convert attribute-style syntax to element style: <tool param="val"> → <tool><param>val</param>
+
+    Some models output tool calls as attributes instead of child elements:
+      <write_to_file path="README.md" content="# Hello" />
+    instead of:
+      <write_to_file><path>README.md</path><content># Hello</content></write_to_file>
+
+    This regex converts the attribute form to element form before ET parsing.
+    Only applies to known tool root tags (not generic XML).
+    """
+    _KNOWN_TOOL_TAGS = (
+        "write_to_file", "read_file", "apply_diff", "replace_in_file",
+        "attempt_completion", "execute_command", "ask_followup_question",
+        "use_mcp_tool", "move_file", "rename_file", "delete_file",
+        "delete_folder", "create_directory", "list_files", "search_files",
+        "bash", "edit", "glob", "grep", "question", "read", "write",
+        "list", "new_task", "browser_action",
+    )
+
+    def _replace_attr(am: re.Match) -> str:
+        k, v = am.group(1), am.group(2)
+        return f"<{k}>{v}</{k}>"
+
+    def _convert_attrs_in_match(tag: str, attrs_part: str, inner: str = "") -> str:
+        attrs_converted = re.sub(r'\s+(\w+)\s*=\s*"([^"]*)"', _replace_attr, attrs_part)
+        attrs_converted = re.sub(r"\s+(\w+)\s*=\s*'([^']*)'", _replace_attr, attrs_converted)
+        return f"<{tag}>{attrs_converted}{inner}</{tag}>"
+
+    tag_pat = "|".join(_KNOWN_TOOL_TAGS)
+
+    # Step 1: self-closing with attributes → non-self-closing
+    # <tool a="b" /> → <tool a="b"></tool>
+    result = re.sub(
+        rf'<({tag_pat})([^>]*)\s*/>',
+        r'<\1\2></\1>',
+        xml_string,
+        flags=re.IGNORECASE,
+    )
+
+    # Step 2: open/close with attributes → element format
+    # <tool a="b">inner</tool> → <tool><a>b</a>inner</tool>
+    result = re.sub(
+        rf'<({tag_pat})([^>]*\s+\w+\s*=\s*["\'][^"\']*["\'][^>]*)>([\s\S]*?)</\1>',
+        lambda m: _convert_attrs_in_match(m.group(1), m.group(2), m.group(3) or ""),
+        result,
+        flags=re.IGNORECASE,
+    )
+    return result
+
+
+def _strip_cdata(xml_string: str) -> str:
+    """Strip CDATA sections and return plain text: <![CDATA[content]]> → content"""
+    return re.sub(r'<!\[CDATA\[([\s\S]*?)\]\]>', r'\1', xml_string)
+
+
 def fix_xml_string(xml_string: str) -> str:
     """
     Attempt to fix common XML issues.
+
+    Pipeline (applied in order):
+    1. Strip CDATA wrappers
+    2. Convert self-closing tags to open/close pairs
+    3. Convert attribute format to element format
+    4. Fix mismatched closing tags for simple param tags
+    5. Insert missing </diff> before escape step
+    6. Escape raw-text tags (content, diff, result, output)
+    7. Fix unescaped ampersands
+    8. Fix pseudo-tags in parentheses
     """
+    fixed = xml_string
+
+    # 1. Strip CDATA — handle <![CDATA[...]]> wrapped content
+    fixed = _strip_cdata(fixed)
+
+    # 2. Self-closing tags: <param/> → <param></param>
+    fixed = _convert_self_closing_tags(fixed)
+
+    # 3. Attribute format: <tool param="val"> → <tool><param>val</param>
+    fixed = _convert_attributes_to_elements(fixed)
+
+    # 4. Strip whitespace in tags: < write_to_file > → <write_to_file>
+    fixed = _strip_whitespace_in_tags(fixed)
+
     # Pre-escape content in "raw text" tags that may contain XML-special characters
     # (e.g. <content> in write_to_file may contain <repo-url>, XML snippets, etc.)
-    _RAW_TEXT_TAGS = ("content", "diff", "result", "output")
+    # `command` is included because shell commands frequently contain unescaped
+    # angle brackets — most notably heredocs (python3 - <<'PY' ... PY) and
+    # redirects (sort < in.txt > out.txt) — which would break ET.fromstring.
+    _RAW_TEXT_TAGS = (
+        "content", "diff", "result", "output",
+        "oldString", "newString", "old_string", "new_string",
+        "command",
+    )
 
     def escape_raw_content(m: re.Match) -> str:
         tag, inner = m.group(1), m.group(2)
@@ -188,14 +391,14 @@ def fix_xml_string(xml_string: str) -> str:
             inner = inner.replace('<', '&lt;').replace('>', '&gt;')
         return f'<{tag}>{inner}</{tag}>'
 
-    # Fix mismatched closing tags for simple parameter tags (no nested XML in their content).
+    # 6. Fix mismatched closing tags for simple parameter tags (no nested XML in their content).
     # The model sometimes closes <path> with </diff> (anticipating the next sibling tag name).
     # e.g. <path>src/Foo.java</diff> → <path>src/Foo.java</path>
     _SIMPLE_PARAM_TAGS = (
         "path", "filePath", "source", "destination",
         "command", "description", "question", "regex",
+        "oldString", "newString", "pattern",
     )
-    fixed = xml_string
     for _tag in _SIMPLE_PARAM_TAGS:
         fixed = re.sub(
             rf'<{re.escape(_tag)}>([^<]*?)</(?!{re.escape(_tag)}\s*>)[a-zA-Z_][a-zA-Z0-9_]*\s*>',
@@ -204,7 +407,7 @@ def fix_xml_string(xml_string: str) -> str:
             flags=re.IGNORECASE,
         )
 
-    # Insert missing </diff> BEFORE escaping so the escape regex can match the full <diff> block
+    # 7. Insert missing </diff> BEFORE escaping so the escape regex can match the full <diff> block
     if re.search(r'<diff\b', fixed, re.IGNORECASE) and not re.search(r'</diff>', fixed, re.IGNORECASE):
         fixed = re.sub(
             r'</(apply_diff|replace_in_file)>',
@@ -213,6 +416,25 @@ def fix_xml_string(xml_string: str) -> str:
             flags=re.IGNORECASE,
         )
 
+    # 7b. Insert missing </edits> when <edits> is present but not closed.
+    #      The regex may match outer <edit> opener with inner </edit> closer, leaving
+    #      <edits> unclosed. Keep the inner </edit>, insert </edits> after it, then
+    #      ensure the outer <edit> is closed.
+    if re.search(r'<edits\b', fixed, re.IGNORECASE) and not re.search(r'</edits>', fixed, re.IGNORECASE):
+        fixed = re.sub(
+            r'</edit>',
+            r'</edit>\n</edits>\n</edit>',
+            fixed,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        # After inserting </edits>, the outer <edit> may still be unclosed.
+        # If XML starts with <edit ...> but doesn't end with </edit>, close it.
+        m = re.match(r'\s*<\s*(\w+)', fixed)
+        if m and not re.search(rf'</\s*{re.escape(m.group(1))}\s*>\s*$', fixed, re.IGNORECASE):
+            fixed = fixed + f'</{m.group(1)}>'
+
+    # 8. Escape raw-text tags
     tag_pat = '|'.join(_RAW_TEXT_TAGS)
     fixed = re.sub(
         rf'<({tag_pat})>([\s\S]*?)</\1>',
@@ -221,10 +443,10 @@ def fix_xml_string(xml_string: str) -> str:
         flags=re.IGNORECASE,
     )
 
-    # Replace remaining unescaped ampersands
+    # 9. Replace remaining unescaped ampersands
     fixed = re.sub(r'&(?!amp;|lt;|gt;|quot;|apos;)', '&amp;', fixed)
 
-    # Fix pseudo-tags in parentheses (e.g., "(</tag>)" -> "(tag)")
+    # 10. Fix pseudo-tags in parentheses (e.g., "(</tag>)" -> "(tag)")
     def replace_pseudo_tags(match):
         content = match.group(1)
         converted = re.sub(r"</?([\w]*)\s*/?>", r"`\1`", content)

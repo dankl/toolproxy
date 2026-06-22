@@ -1,0 +1,8 @@
+services:
+  toolproxy:
+    build: .
+    ports:
+      - "8007:8007"
+    env_file:
+      - .env
+    restart: always

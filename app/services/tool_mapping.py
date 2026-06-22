@@ -75,6 +75,7 @@ _TOOL_NAME_ALIASES: Dict[str, str] = {
     "rename": "move_file",          # hallucinated rename → move_file (Roo Code builtin)
     "move": "move_file",            # hallucinated move → move_file
     "bash": "execute_command",      # OpenCode-style name / hallucination
+    "exec": "execute_command",      # OpenCode-style exec → bash
     "edit_file": "edit",            # hallucinated name → OpenCode edit tool
     "run_command": "execute_command",
     "execute": "execute_command",
@@ -243,10 +244,21 @@ def _remap_args_to_schema(
         changed = False
         for key, value in args.items():
             if key not in schema_params:
+                # Try direct alias lookup
                 candidates = _SCHEMA_PARAM_ALIASES.get(key, [])
                 target = next((c for c in candidates if c in schema_params), None)
+                # Try case-insensitive match if direct alias fails
+                if target is None:
+                    target = next(
+                        (s for s in schema_params if s.lower() == key.lower()),
+                        None,
+                    )
+                    if target:
+                        logger.info(
+                            f"[{request_id}] Schema remap {name}: {key!r} → {target!r} "
+                            f"(case-insensitive match)"
+                        )
                 if target:
-                    logger.info(f"[{request_id}] Schema remap {name}: {key!r} → {target!r}")
                     remapped[target] = value
                     changed = True
                     continue
